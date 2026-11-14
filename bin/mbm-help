@@ -1,0 +1,47 @@
+#!/bin/bash
+# mbm-help - list the commands of this installation, each with one line about what it does.
+#
+#   mbm-help            every command
+#   mbm-help WORD       only the commands whose name or description contains WORD
+
+set -u
+
+# The real location of this file, through the symlink the installer made, and the name it
+# was called by (the installer may have given the commands another prefix than mbm-).
+ME="$(basename "$0")"
+SELF="$0"
+while [ -L "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+ROOT="$(cd "$SELF_DIR/.." && pwd)"
+
+case "${1:-}" in
+  -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" | sed "s/mbm-help/$ME/g"; exit 0 ;;
+esac
+
+# The folder the command was called from holds the commands under their installed names.
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+PFX="${ME%help}"
+word="${1:-}"
+
+# name<TAB>description, names without the prefix. local/ holds your private commands.
+describe() {
+  awk -F '\t' -v k="$1" '$1 == k { print $2; found = 1; exit } END { if (!found) print "" }' \
+    "$ROOT/libexec/descriptions.txt" "$ROOT/local/descriptions.txt" 2>/dev/null | head -n 1
+}
+
+for f in "$BIN_DIR"/"$PFX"*; do
+  [ -e "$f" ] || continue
+  name="$(basename "$f")"
+  desc="$(describe "${name#"$PFX"}")"
+  line="$(printf '%-40s %s' "$name" "$desc")"
+  if [ -n "$word" ]; then
+    printf '%s\n' "$line" | grep -i -F -- "$word"
+  else
+    printf '%s\n' "$line"
+  fi
+done
+exit 0

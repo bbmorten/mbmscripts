@@ -1,0 +1,20 @@
+#!/bin/zsh
+
+# Not working
+# Check that three arguments were passed
+if [ $# -ne 3 ]; then
+  echo "Usage: $0 [remote user] [remote host] [remote folder]"
+  exit 1
+fi
+
+# Set variables for remote user, host, and folder
+REMOTE_USER="$1"
+REMOTE_HOST="$2"
+REMOTE_FOLDER="$3"
+
+# Use ssh to forward fswatch output to local machine and monitor remote folder
+ssh -N -T -L 1234:localhost:1234 "$REMOTE_USER@$REMOTE_HOST" "fswatch $REMOTE_FOLDER | socat - TCP:localhost:1234" |
+  while read path; do
+    echo "Change detected in remote folder '$REMOTE_FOLDER', syncing with local folder..."
+    rsync -avz -e 'ssh -p 22 -o StrictHostKeyChecking=no' "$REMOTE_USER@$REMOTE_HOST:$REMOTE_FOLDER" ./
+  done

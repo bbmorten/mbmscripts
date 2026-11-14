@@ -1,0 +1,29 @@
+#!/bin/zsh
+
+# Check if a directory path is provided as an argument
+if [ -z "$1" ]; then
+    echo "Please provide a starting point directory as an argument."
+    exit 1
+fi
+
+starting_dir="$1"
+
+# Search for PDF files recursively within the starting directory
+pdf_files=($starting_dir/**/*.pdf(N))
+
+# Extract the directory names from the file paths and remove duplicates
+folder_names=()
+for file in "${pdf_files[@]}"; do
+    folder=$(dirname "$file")
+    folder_names+=("$folder")
+done
+unique_folder_names=("${(@u)folder_names}")
+
+# Sort the folder names alphabetically
+sorted_folder_names=("${(@o)unique_folder_names}")
+
+# Print the folder names alphabetically
+echo "Folder names containing PDF files:"
+for folder in "${sorted_folder_names[@]}"; do
+    echo "$folder"
+done

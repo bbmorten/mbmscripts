@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Check that a directory path was provided as an argument
+if [ $# -eq 0 ]; then
+  echo "Please provide a directory path as an argument"
+  exit 1
+fi
+
+# Set the directory to the first argument
+dir="$1"
+
+# Get the current timestamp in ISO format (YYYY-MM-DDTHH:MM:SS)
+timestamp=$(date +'%Y-%m-%dT%H:%M:%S')
+
+# Set the output file name to the second argument, or use an automatic file name
+if [ $# -gt 1 ]; then
+  output_file="$2"
+else
+  output_file="directory_sizes_$timestamp.txt"
+fi
+
+# Use the du command to get the size of each subdirectory, and sort the output
+du -hd 1 "$dir" | sort -hr > "$output_file"
+
+# Print a message indicating where the output was saved
+echo "Directory sizes saved to $output_file"
+

@@ -1,0 +1,13 @@
+#!/usr/bin/env zsh
+
+cd ~/git-repos/docker-v3
+source ~/git-repos/docker-v3/.venv/bin/activate
+mkdocs build
+rsync -avz ~/git-repos/docker-v3/site/ vm@$1:~/docker/
+
+# Prompt user to enter a port number
+port=$2 || 5500
+
+# Start Nginx container with the specified port number
+ssh vm@$1 "docker run --rm -d -p $port:80 -v /home/vm/docker/:/usr/share/nginx/html:ro nginx"
+

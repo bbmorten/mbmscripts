@@ -1,0 +1,37 @@
+btvpn	Connect to your company's Cisco VPN with one command (Keychain password, SMS code from Messages)
+change-filename	Rename DDMMYYYY.md files in a folder to YYYYMMDD.md
+copy-zsh-settings	Copy your zsh configuration to a remote Mac over ssh
+cp-dir-structure	Copy a directory tree without its files
+cp-dir-structure-w-files	Copy a directory, optionally adding an index.md
+create-outline-markdown	Turn the list items of a Markdown file into links to generated pages
+delete-old-models	Delete ollama models that were not modified for more than a week
+dns-flush	Flush the macOS DNS cache and restart the DNS service (asks for your Mac password)
+docker-cmdline	Print the entrypoint and command of a container
+docker-compose-start-services	Start the Docker Compose projects named on the command line
+docker-compose-stop-services-all	Stop every running Docker Compose project
+du	Save the size of each subdirectory, largest first, to a file
+eth-conv	Count the Ethernet conversations in a capture file (tshark)
+extract-time-info-w-tshark	First packet, last packet and duration of a capture file
+find-and-delete-duplicates	Find files with identical content and offer to delete the copies
+find-file	Find a file by name under a starting folder
+find-files-over-100m	List the files larger than 100 MB under a folder
+help	List these commands
+insert-date	Replace {{DATE}} in a file with today's date
+interface-test	Take the ens160 network interface down for 60 seconds, then up again (Linux)
+lima-podman-w-target	Start Lima with Podman from a sparsebundle on an external volume
+list-folders-with-pdf	List the folders that contain PDF files
+logger	Record this terminal session to a log file
+multivpn	Keep a second VPN connected next to the company one (openconnect + ocproxy)
+my-sync	Rsync a folder each time it changes (Linux, inotifywait)
+my-sync-fswatch	Pull a remote folder when it changes (fswatch over ssh; its author marked it "not working")
+nextra-setup	Scaffold a Nextra documentation project
+nextra-setup-w-podman	Scaffold a Nextra documentation project that runs with Podman
+print-route	Print one line of the routing table for the interface you name
+replace-heading	Rewrite "# DDMMYYYY" first-line headings of Markdown files as "# YYYYMMDD"
+run-docker-web	Build the mkdocs site in ~/git-repos/docker and serve it with nginx on a remote host
+run-docker-web3	Build the mkdocs site in ~/git-repos/docker-v3 and serve it with nginx on a remote host
+sdd	Serve the mkdocs site in ~/git-repos/docker
+srd	Start the Docker Compose stack in ~/git-repos/mydocs
+sslkeylog-capture	Browse with TLS keys logged while tshark captures the packets
+sync-git-msp	Rsync a local folder to a remote host (dry run, watch mode)
+sync-git-msp-v2	Rsync a local folder to a remote host (live progress, history, watch mode)

@@ -1,0 +1,55 @@
+#!/bin/bash
+
+# Set default values for options
+do_task=false
+copy_files=false
+
+# Parse options and parameters
+while getopts ":tc" opt; do
+  case $opt in
+    t)
+      do_task=true
+      ;;
+    c)
+      copy_files=true
+      ;;
+    \?)
+      echo "Invalid option: -$OPTARG" >&2
+      exit 1
+      ;;
+    :)
+      echo "Option -$OPTARG requires an argument." >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Shift the option arguments so that we can access the remaining parameters
+shift $((OPTIND-1))
+
+# Check that there are exactly two parameters (source and destination)
+if [ $# -ne 2 ]; then
+    echo "Usage: $0 [-t] [-c] source destination"
+    exit 1
+fi
+
+# Set the source and destination directories
+source_dir=$1
+destination_dir=$2
+
+# Perform the task if the -t option was specified
+if [ "$do_task" = true ]; then
+    echo "Performing task on source directory $source_dir"
+fi
+
+# Copy the source directory to the destination directory
+cp -r "$source_dir" "$destination_dir"
+
+# Perform additional actions if the -c option was specified
+if [ "$copy_files" = true ]; then
+    echo "Copying additional files to directory $destination_dir"
+    #cp /path/to/additional/files/* "$destination_dir"
+    touch "$destination_dir/index.md"
+fi
+
+echo "Done."

@@ -1,0 +1,49 @@
+#!/bin/sh
+# multivpn-proxy - the openconnect --script-tun program used by multivpn in proxy mode.
+#
+# openconnect hands the VPN packets to this program (VPNFD) instead of a tunnel interface. It
+# records what the server offered in the state file, then becomes ocproxy, which serves the
+# training network as a SOCKS5 proxy (and optional port forwards) on 127.0.0.1.
+# No interface, no route, no DNS change and no root: Cisco Secure Client has nothing to undo.
+#
+# From multivpn, through the environment:
+#   MULTIVPN_STATE        state file to write
+#   MULTIVPN_OCPROXY      path of ocproxy
+#   MULTIVPN_SOCKS_PORT   SOCKS5 port on 127.0.0.1
+#   MULTIVPN_FORWARDS     space-separated lport:host:rport
+
+STATE="${MULTIVPN_STATE:-}"
+OCPROXY="${MULTIVPN_OCPROXY:-ocproxy}"
+PORT="${MULTIVPN_SOCKS_PORT:-11080}"
+
+nets=""
+if [ -n "${CISCO_SPLIT_INC:-}" ] && [ "$CISCO_SPLIT_INC" -gt 0 ] 2>/dev/null; then
+  i=0
+  while [ "$i" -lt "$CISCO_SPLIT_INC" ]; do
+    eval "addr=\${CISCO_SPLIT_INC_${i}_ADDR:-}"
+    eval "len=\${CISCO_SPLIT_INC_${i}_MASKLEN:-}"
+    [ -n "$addr" ] && [ -n "$len" ] && nets="$nets $addr/$len"
+    i=$((i + 1))
+  done
+fi
+
+if [ -n "$STATE" ]; then
+  umask 077
+  {
+    echo "MODE=proxy"
+    echo "ADDRESS=${INTERNAL_IP4_ADDRESS:-}"
+    echo "GATEWAY=${VPNGATEWAY:-}"
+    echo "SOCKS_PORT=$PORT"
+    echo "FORWARDS=${MULTIVPN_FORWARDS:-}"
+    echo "NETWORKS=${nets# }"
+    echo "DNS_OFFERED=${INTERNAL_IP4_DNS:-}"
+    echo "DOMAIN_OFFERED=${CISCO_DEF_DOMAIN:-}"
+    echo "SINCE=$(date +%s)"
+  } > "$STATE"
+fi
+
+set -- "$OCPROXY" -D "$PORT" -k 30
+for f in ${MULTIVPN_FORWARDS:-}; do
+  set -- "$@" -L "$f"
+done
+exec "$@"

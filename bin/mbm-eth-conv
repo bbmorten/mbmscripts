@@ -1,0 +1,23 @@
+#!/bin/bash
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <file.pcap>"
+    exit 1
+fi
+
+if [ ! -f "$1" ]; then
+    echo "Error: $1 is not a file."
+    exit 1
+fi
+
+tshark -r "$1" -T fields -e eth.src -e eth.dst | \
+gawk '{
+    key = ($1 < $2 ? $1 "," $2 : $2 "," $1); # Use a comma as separator
+    arr[key]++;
+}
+END {
+    for (key in arr) {
+        n = split(key, macs, ","); # Split using a comma as separator
+        print "{ \"src\": \"" macs[1] "\", \"dst\": \"" macs[2] "\", \"count\": " arr[key] " }";
+    }
+}'

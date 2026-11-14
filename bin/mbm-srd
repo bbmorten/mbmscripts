@@ -1,0 +1,3 @@
+#!/bin/zsh
+source $HOME/git-repos/mydocs/.venv/bin/activate
+cd ~/git-repos/mydocs && docker compose up -d

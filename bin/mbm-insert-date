@@ -1,0 +1,21 @@
+#!/bin/zsh
+
+# Check if the filename argument is provided
+if [ $# -eq 0 ]; then
+  echo "Usage: mbm-insert-date <filename.md>"
+  exit 1
+fi
+
+# Store the filename provided as an argument
+filename="$1"
+
+# Create a temporary file
+tmpfile=$(mktemp)
+
+# Replace {{DATE}} with the current date and write to the temporary file
+sed "s/{{DATE}}/$(date '+%Y-%m-%d')/g" "$filename" > "$tmpfile"
+
+# Move the temporary file to overwrite the original Markdown file
+mv "$tmpfile" "$filename"
+
+

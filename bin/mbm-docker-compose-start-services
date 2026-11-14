@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# Define the base directory where your Docker Compose project folders are stored
+BASE_DIR=~/git-repos
+
+# Loop through each project name passed as an argument to the script
+for project in "$@"; do
+  project_dir="$BASE_DIR/$project"
+
+  # Check if the project directory exists
+  if [ -d "$project_dir" ]; then
+    # Check if a docker-compose.yml file exists in the project directory
+    if [ -f "$project_dir/docker-compose.yml" ]; then
+      echo "Starting project $project..."
+      # Run the docker compose up command in detached mode to start the project in the background
+      docker compose -f "$project_dir/docker-compose.yml" up -d
+    else
+      echo "Warning: No docker-compose.yml file found in $project_dir."
+    fi
+  else
+    echo "Warning: Directory $project_dir does not exist."
+  fi
+done

@@ -1,0 +1,29 @@
+#!/bin/bash
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <file.pcap>"
+    exit 1
+fi
+
+if [ ! -f "$1" ]; then
+    echo "Error: $1 is not a file."
+    exit 1
+fi
+
+# Replace with your capture file
+CAPTURE_FILE=$1
+
+# Get first and last packet time
+FIRST_PACKET=$(tshark -r "$CAPTURE_FILE" -T fields -e frame.time -c 1)
+LAST_PACKET=$(tshark -r "$CAPTURE_FILE" -T fields -e frame.time -Y "frame.number==$(tshark -r "$CAPTURE_FILE" -T fields -e frame.number | tail -1)")
+
+# Convert to seconds since epoch
+FIRST_EPOCH=$(date -j -f "%b %d, %Y %H:%M:%S" "$(echo $FIRST_PACKET | cut -d' ' -f1-5)" +%s)
+LAST_EPOCH=$(date -j -f "%b %d, %Y %H:%M:%S" "$(echo $LAST_PACKET | cut -d' ' -f1-5)" +%s)
+
+# Calculate elapsed time
+ELAPSED=$(($LAST_EPOCH - $FIRST_EPOCH))
+
+echo "First packet: $FIRST_PACKET"
+echo "Last packet: $LAST_PACKET"
+echo "Elapsed: $(date -u -r $ELAPSED +"%T")"

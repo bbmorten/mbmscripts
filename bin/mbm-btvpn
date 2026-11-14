@@ -1,0 +1,360 @@
+#!/bin/bash
+# mbm-btvpn - connect to your company VPN from the terminal with the Cisco Secure Client CLI.
+#
+# One command instead of the Secure Client window: the password comes from the macOS Keychain
+# and, when the VPN sends a code by SMS, the code is read from the Messages app.
+#
+# Usage:
+#   mbm-btvpn setup                   answer a few questions once (VPN entry, username, password, SMS)
+#   mbm-btvpn connect [split|full]    connect (default: split, your everyday entry)
+#   mbm-btvpn disconnect
+#   mbm-btvpn status
+#   mbm-btvpn set-password [user]     store or change the VPN password in the macOS Keychain
+#   mbm-btvpn sms-test [minutes]      show the code the SMS reader finds (Messages, last 60 min)
+#   mbm-btvpn hosts                   the VPN entries Cisco Secure Client has on this Mac
+#
+# Options for connect:
+#   -u USER       VPN username (default: the one saved by setup)
+#   -s CODE       authentication code given inline; otherwise, when the server asks, the code is
+#                 read from the SMS (Messages app; the terminal app needs Full Disk Access) or
+#                 typed - whichever comes first.
+#
+# Settings, in ~/.config/btvpn/btvpn.conf (written by "mbm-btvpn setup", shell syntax). A variable
+# of the same name in the environment wins over the file.
+#   BTVPN_HOST_SPLIT   Secure Client entry (or server address) for everyday use
+#   BTVPN_HOST_FULL    optional entry that sends ALL traffic through the VPN: mbm-btvpn connect full
+#   BTVPN_USER         VPN username
+#   BTVPN_GROUP        answer to a "Group:" question, when the server asks one (empty = its default)
+#   BTVPN_SMS          1 = read the code from Messages (default), 0 = always type it
+#   BTVPN_SMS_FROM     only SMS whose sender contains this text
+#   BTVPN_SMS_REGEX    how the code is found in the SMS text (see libexec/btvpn-sms-code)
+#   BTVPN_KC_SERVICE   Keychain service name of the password item (default: btvpn)
+#
+# Prompts are answered one by one by libexec/btvpn-connect.exp (expect).
+# Bash 3.2 compatible (the macOS /bin/bash).
+
+set -u
+
+# The real location of this file, through the symlink the installer made, and the name it
+# was called by (the installer may have given the commands another prefix than mbm-).
+ME="$(basename "$0")"
+SELF="$0"
+while [ -L "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIBEXEC="$(cd "$SELF_DIR/../libexec" 2>/dev/null && pwd)"
+CONF="${BTVPN_CONF:-$HOME/.config/btvpn/btvpn.conf}"
+CONF_KEYS="BTVPN_HOST_SPLIT BTVPN_HOST_FULL BTVPN_USER BTVPN_GROUP BTVPN_SMS BTVPN_SMS_FROM BTVPN_SMS_REGEX BTVPN_KC_SERVICE"
+
+die() { echo "$ME: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- settings
+
+# Read the file, then put back every value the environment had set: the environment wins.
+for _k in $CONF_KEYS; do
+  eval "_env_$_k=\"\${$_k-}\"; _had_$_k=\"\${$_k+1}\""
+done
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+for _k in $CONF_KEYS; do
+  eval "[ -n \"\$_had_$_k\" ] && $_k=\"\$_env_$_k\""
+done
+BTVPN_HOST_SPLIT="${BTVPN_HOST_SPLIT:-}"
+BTVPN_HOST_FULL="${BTVPN_HOST_FULL:-}"
+BTVPN_USER="${BTVPN_USER:-}"
+BTVPN_GROUP="${BTVPN_GROUP:-}"
+BTVPN_SMS="${BTVPN_SMS:-1}"
+BTVPN_SMS_FROM="${BTVPN_SMS_FROM:-}"
+BTVPN_SMS_REGEX="${BTVPN_SMS_REGEX:-}"
+KC_SERVICE="${BTVPN_KC_SERVICE:-btvpn}"
+# The SMS reader takes these two from the environment.
+export BTVPN_SMS_FROM BTVPN_SMS_REGEX
+
+write_conf() {
+  mkdir -p "$(dirname "$CONF")" || die "could not create $(dirname "$CONF")"
+  {
+    echo "# btvpn settings (see: $ME help). Rewritten by: $ME setup"
+    printf 'BTVPN_HOST_SPLIT=%q\n' "$BTVPN_HOST_SPLIT"
+    printf 'BTVPN_HOST_FULL=%q\n' "$BTVPN_HOST_FULL"
+    printf 'BTVPN_USER=%q\n' "$BTVPN_USER"
+    printf 'BTVPN_GROUP=%q\n' "$BTVPN_GROUP"
+    printf 'BTVPN_SMS=%q\n' "$BTVPN_SMS"
+    printf 'BTVPN_SMS_FROM=%q\n' "$BTVPN_SMS_FROM"
+    printf 'BTVPN_SMS_REGEX=%q\n' "$BTVPN_SMS_REGEX"
+    printf 'BTVPN_KC_SERVICE=%q\n' "$KC_SERVICE"
+  } > "$CONF" || die "could not write $CONF"
+  chmod 600 "$CONF"
+}
+
+# ---------------------------------------------------------------- Cisco Secure Client
+
+# Secure Client 5 first, then the older AnyConnect 4 layout.
+VPN=""
+for _d in /opt/cisco/secureclient /opt/cisco/anyconnect; do
+  if [ -x "$_d/bin/vpn" ]; then VPN="$_d/bin/vpn"; break; fi
+done
+
+need_client() {
+  [ -n "$VPN" ] || die "Cisco Secure Client is not installed on this Mac (no /opt/cisco/secureclient/bin/vpn).
+  Install it first - your IT department gives you the installer - and connect once with its window."
+}
+
+# The entry names in the profiles Secure Client downloaded from the company's VPN server.
+profile_hosts() {
+  local d f
+  for d in /opt/cisco/secureclient/vpn/profile /opt/cisco/anyconnect/profile; do
+    for f in "$d"/*.xml; do
+      [ -r "$f" ] || continue
+      sed -n 's/.*<HostName>\([^<]*\)<\/HostName>.*/\1/p' "$f"
+    done
+  done | awk 'NF && !seen[$0]++'
+}
+
+# The CLI cannot connect while the window holds the VPN service.
+quit_gui() {
+  local app
+  for app in "Cisco Secure Client" "Cisco AnyConnect Secure Mobility Client"; do
+    if pgrep -xq "$app"; then
+      echo "Quitting the $app window (the command line cannot connect while it is open)..."
+      osascript -e "quit app \"$app\"" >/dev/null 2>&1
+      for _ in 1 2 3 4 5; do pgrep -xq "$app" || break; sleep 1; done
+      pgrep -xq "$app" && pkill -x "$app"
+    fi
+  done
+}
+
+vpn_state() {
+  "$VPN" state 2>/dev/null | sed -n 's/.*state: *\([A-Za-z]*\).*/\1/p' | tail -n 1
+}
+
+# ---------------------------------------------------------------- Keychain
+
+# The account name of the first Keychain item for our service, if any.
+kc_user() {
+  security find-generic-password -s "$KC_SERVICE" 2>/dev/null \
+    | sed -n 's/^ *"acct"<blob>="\(.*\)"$/\1/p' | head -n 1
+}
+
+kc_password() {
+  security find-generic-password -s "$KC_SERVICE" -a "$1" -w 2>/dev/null
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_set_password() {
+  local user="${1:-$BTVPN_USER}"
+  if [ -z "$user" ]; then
+    printf "VPN username: "
+    read -r user
+  fi
+  [ -n "$user" ] || die "a username is required"
+  echo "Type the VPN password for $user (nothing is shown while you type), then press Enter."
+  # -U updates an existing item; -w as the last argument makes security prompt for the password.
+  security add-generic-password -U -s "$KC_SERVICE" -a "$user" -l "btvpn ($user)" -w \
+    || die "could not save the password to the Keychain"
+  echo "Saved the password for $user in the login Keychain (service $KC_SERVICE)."
+}
+
+# ask QUESTION [DEFAULT]: the answer, or the default on a bare Enter, lands in ANSWER.
+ANSWER=""
+ask() {
+  local a=""
+  if [ -n "${2:-}" ]; then printf '%s [%s]: ' "$1" "$2"; else printf '%s: ' "$1"; fi
+  read -r a || a=""
+  ANSWER="${a:-${2:-}}"
+}
+
+# A typed number means the entry at that position of the list; anything else is taken as typed.
+resolve_host() {
+  local typed="$1" list="$2" picked
+  case "$typed" in
+    ''|*[!0-9]*) echo "$typed" ;;
+    *) picked="$(printf '%s\n' "$list" | sed -n "${typed}p")"
+       echo "${picked:-$typed}" ;;
+  esac
+}
+
+cmd_setup() {
+  local hosts n line def
+  [ -t 0 ] || die "setup asks questions: run it in a Terminal window"
+  need_client
+
+  echo "$ME setup. Press Enter to keep the value shown in [brackets]."
+  echo
+  echo "1. Which VPN"
+  hosts="$(profile_hosts)"
+  if [ -n "$hosts" ]; then
+    echo "   Cisco Secure Client has these VPN entries on this Mac:"
+    n=0
+    while IFS= read -r line; do
+      n=$((n + 1))
+      printf '     %d) %s\n' "$n" "$line"
+    done <<EOF_BTVPN_HOSTS
+$hosts
+EOF_BTVPN_HOSTS
+    def="${BTVPN_HOST_SPLIT:-1}"
+    ask "   The one you use every day (its number or its name)" "$def"
+    BTVPN_HOST_SPLIT="$(resolve_host "$ANSWER" "$hosts")"
+    echo "   Some companies have a second entry that sends ALL your traffic through the VPN."
+    ask "   That entry, if you have one (number or name; Enter = none)" "$BTVPN_HOST_FULL"
+    BTVPN_HOST_FULL="$(resolve_host "$ANSWER" "$hosts")"
+  else
+    echo "   Cisco Secure Client has no saved VPN entry on this Mac yet."
+    echo "   Type the VPN address your company gave you - the same text you type in the"
+    echo "   Secure Client window, for example vpn.example.com."
+    ask "   VPN address" "$BTVPN_HOST_SPLIT"
+    BTVPN_HOST_SPLIT="$ANSWER"
+  fi
+  [ -n "$BTVPN_HOST_SPLIT" ] || die "a VPN entry is required"
+  [ "$BTVPN_HOST_FULL" = "$BTVPN_HOST_SPLIT" ] && BTVPN_HOST_FULL=""
+
+  echo
+  echo "2. Your login"
+  ask "   VPN username" "${BTVPN_USER:-$(kc_user)}"
+  BTVPN_USER="$ANSWER"
+  [ -n "$BTVPN_USER" ] || die "a username is required"
+
+  echo
+  echo "3. The code sent by text message (SMS)"
+  echo "   If the VPN sends you a code by SMS at every login, btvpn can read it from the Messages"
+  echo "   app, so you do not type it. The README explains the two switches this needs (your"
+  echo "   iPhone forwards text messages to this Mac; the terminal app has Full Disk Access)."
+  echo "   Without them btvpn simply asks you to type the code."
+  if [ "$BTVPN_SMS" = 0 ]; then def=n; else def=y; fi
+  ask "   Read the SMS code automatically? (y/n)" "$def"
+  case "$ANSWER" in
+    n|N|no|No|NO) BTVPN_SMS=0 ;;
+    *) BTVPN_SMS=1
+       echo "   To be safe, btvpn can look only at messages from one sender. Type part of the"
+       echo "   sender's name exactly as Messages shows it, or press Enter to accept any sender."
+       ask "   Sender" "$BTVPN_SMS_FROM"
+       BTVPN_SMS_FROM="$ANSWER" ;;
+  esac
+
+  write_conf
+  echo
+  echo "Saved $CONF"
+  echo
+  echo "4. Your password"
+  cmd_set_password "$BTVPN_USER"
+  echo
+  echo "All set. Connect with:      $ME connect"
+  echo "         Disconnect with:   $ME disconnect"
+}
+
+cmd_connect() {
+  local user="$BTVPN_USER" second="" mode host pass state rc opt
+  local helper="$LIBEXEC/btvpn-connect.exp"
+  need_client
+  [ -r "$helper" ] || die "helper not found: $helper"
+  OPTIND=1
+  while getopts "u:s:" opt; do
+    case "$opt" in
+      u) user="$OPTARG" ;;
+      s) second="$OPTARG" ;;
+      *) die "unknown option; see: $ME help" ;;
+    esac
+  done
+  shift $((OPTIND - 1))
+  mode="${1:-split}"
+  case "$mode" in
+    split) host="$BTVPN_HOST_SPLIT"
+           [ -n "$host" ] || die "not set up yet. Run: $ME setup" ;;
+    full)  host="$BTVPN_HOST_FULL"
+           [ -n "$host" ] || die "no full-tunnel entry is set. Run: $ME setup" ;;
+    *) die "mode must be split or full, got: $mode" ;;
+  esac
+
+  state="$(vpn_state)"
+  [ "$state" = "Connected" ] && { echo "Already connected. Run: $ME disconnect"; exit 0; }
+
+  [ -n "$user" ] || user="$(kc_user)"
+  [ -n "$user" ] || die "no username. Run: $ME setup   (or pass -u USER)"
+
+  pass="$(kc_password "$user")"
+  if [ -z "$pass" ]; then
+    printf "Password for %s: " "$user"
+    stty -echo; read -r pass; stty echo; echo
+  fi
+  [ -n "$pass" ] || die "empty password"
+
+  quit_gui
+
+  # Read the SMS code from Messages unless BTVPN_SMS=0. Start a few seconds early so a
+  # clock skew between the phone and this Mac cannot hide the message.
+  local sms_helper="" since
+  since=$(( $(date +%s) - 5 ))
+  if [ "$BTVPN_SMS" != 0 ] && [ -x "$LIBEXEC/btvpn-sms-code" ]; then
+    sms_helper="$LIBEXEC/btvpn-sms-code"
+  fi
+
+  echo "Connecting to $host ($mode tunnel) as $user..."
+  # Secrets go through the environment of the helper only (never argv); it unsets the
+  # password before starting the vpn client.
+  BTVPN_VPN="$VPN" BTVPN_HOST="$host" BTVPN_USER_NAME="$user" BTVPN_PASS="$pass" \
+    BTVPN_GROUP="$BTVPN_GROUP" BTVPN_SECOND="$second" BTVPN_SMS_HELPER="$sms_helper" \
+    BTVPN_SINCE="$since" /usr/bin/expect -f "$helper"
+  rc=$?
+  pass=""
+
+  state="$(vpn_state)"
+  if [ "$state" = "Connected" ]; then
+    echo "Connected ($mode tunnel)."
+    "$VPN" stats 2>/dev/null | grep -E 'Client Address \(IPv4\)|Server Address|Tunnel Mode' | sed 's/^ */  /'
+  else
+    die "not connected (state: ${state:-unknown}, helper exit $rc)."
+  fi
+}
+
+cmd_disconnect() {
+  need_client
+  "$VPN" disconnect 2>&1 | grep -E '>> (state|notice|error)' || true
+  echo "State: $(vpn_state)"
+}
+
+cmd_status() {
+  need_client
+  echo "State: $(vpn_state)"
+  if [ "$(vpn_state)" = "Connected" ]; then
+    "$VPN" stats 2>/dev/null | grep -E 'Client Address \(IPv4\)|Server Address|Tunnel Mode|Duration|Bytes (Sent|Received)' | sed 's/^ */  /'
+  fi
+  return 0
+}
+
+cmd_hosts() {
+  local hosts
+  hosts="$(profile_hosts)"
+  if [ -n "$hosts" ]; then
+    printf '%s\n' "$hosts"
+  else
+    echo "Cisco Secure Client has no saved VPN entry on this Mac."
+  fi
+}
+
+# Show what the SMS reader sees in the last N minutes (default 60).
+cmd_sms_test() {
+  local mins="${1:-60}"
+  case "$mins" in ''|*[!0-9]*) die "sms-test takes a number of minutes, got: $mins" ;; esac
+  "$LIBEXEC/btvpn-sms-code" -v $(( $(date +%s) - mins * 60 ))
+  case $? in
+    0) ;;
+    1) echo "No SMS with a code in the last $mins minutes." ;;
+    3) echo "Cannot read ~/Library/Messages/chat.db: give your terminal app Full Disk Access"
+       echo "(System Settings > Privacy & Security > Full Disk Access), then quit and reopen it." ;;
+  esac
+}
+
+case "${1:-help}" in
+  setup)               cmd_setup ;;
+  connect|c|up)        shift; cmd_connect "$@" ;;
+  disconnect|d|down)   cmd_disconnect ;;
+  status|s|state)      cmd_status ;;
+  set-password)        shift; cmd_set_password "${1:-}" ;;
+  hosts)               cmd_hosts ;;
+  sms-test)            shift; cmd_sms_test "${1:-}" ;;
+  help|-h|--help)      awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" | sed "s/mbm-btvpn/$ME/g" ;;
+  *) die "unknown command: $1 (try: $ME help)" ;;
+esac

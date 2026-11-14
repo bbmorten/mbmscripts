@@ -1,0 +1,58 @@
+#!/bin/bash
+# mbm-delete-old-models
+# This script deletes ollama models that were modified more than 1 week ago.
+
+# One week in seconds
+THRESHOLD=604800
+
+# Function to convert the modified time (value + unit) to seconds
+parse_time() {
+    local value=$1
+    local unit=$2
+    case "$unit" in
+        minute|minutes)
+            echo $(( value * 60 ))
+            ;;
+        hour|hours)
+            echo $(( value * 3600 ))
+            ;;
+        day|days)
+            echo $(( value * 86400 ))
+            ;;
+        month|months)
+            # Approximate a month as 30 days
+            echo $(( value * 30 * 86400 ))
+            ;;
+        year|years)
+            # Approximate a year as 365 days
+            echo $(( value * 365 * 86400 ))
+            ;;
+        *)
+            echo 0
+            ;;
+    esac
+}
+
+# Get the list of models and skip the header line.
+# Each line is expected to have a format like:
+# NAME    ID    SIZE    <value> <unit> ago
+ollama list | tail -n +2 | while IFS= read -r line; do
+    # Extract the model name (first column)
+    name=$(echo "$line" | awk '{print $1}')
+    
+    # Extract the modified info from the end of the line.
+    # We assume the last three fields are: value, unit, and "ago".
+    modified_value=$(echo "$line" | awk '{print $(NF-2)}')
+    modified_unit=$(echo "$line" | awk '{print $(NF-1)}')
+    
+    # Convert the relative time to seconds.
+    seconds=$(parse_time "$modified_value" "$modified_unit")
+    
+    if (( seconds >= THRESHOLD )); then
+        echo "Deleting model: $name (modified $modified_value $modified_unit ago)"
+        ollama rm  "$name"
+    else
+        echo "Keeping model: $name (modified $modified_value $modified_unit ago)"
+    fi
+done
+

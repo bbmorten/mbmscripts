@@ -1,0 +1,149 @@
+#!/usr/bin/expect -f
+# Helper for mbm-btvpn: drives "vpn connect <host>" prompt by prompt.
+# Inputs come from the environment (set by mbm-btvpn, never on the command line):
+#   BTVPN_VPN, BTVPN_HOST, BTVPN_USER_NAME, BTVPN_PASS, optional BTVPN_SECOND, BTVPN_GROUP
+# Exit: 0 connected, 1 login failed, 2 timeout / unexpected end.
+
+set timeout 60
+log_user 0
+
+# Print to the terminal via stderr: when stdin closes, expect closes its user channel
+# (stdin + stdout) and send_user would fail.
+proc say {msg} { puts -nonewline stderr $msg; flush stderr }
+
+set vpn  $env(BTVPN_VPN)
+set host $env(BTVPN_HOST)
+set user $env(BTVPN_USER_NAME)
+set pass $env(BTVPN_PASS)
+set second ""
+if {[info exists env(BTVPN_SECOND)]} { set second $env(BTVPN_SECOND) }
+set group ""
+if {[info exists env(BTVPN_GROUP)]} { set group $env(BTVPN_GROUP) }
+# SMS watch: BTVPN_SMS_HELPER (btvpn-sms-code) + BTVPN_SINCE (unix time the connect began).
+set sms_helper ""
+# Cleared when stdin closes (no terminal): then only the SMS can supply the code.
+set user_input 1
+if {[info exists env(BTVPN_SMS_HELPER)] && [info exists env(BTVPN_SINCE)]} {
+    set sms_helper $env(BTVPN_SMS_HELPER)
+    set since $env(BTVPN_SINCE)
+}
+
+# Wait for the code: poll Messages for the SMS every 2 s and accept typed input in between.
+proc wait_for_code {} {
+    global sms_helper since
+    set deadline [expr {[clock seconds] + 300}]
+    if {$sms_helper ne ""} {
+        say "Authentication code (waiting for the SMS, or type it): "
+    } else {
+        say "Authentication code: "
+    }
+    while {[clock seconds] < $deadline} {
+        if {$sms_helper ne ""} {
+            if {[catch {exec $sms_helper $since 2>/dev/null} out]} {
+                set ec 1
+                if {[lindex $::errorCode 0] eq "CHILDSTATUS"} { set ec [lindex $::errorCode 2] }
+                if {$ec == 3} {
+                    set sms_helper ""
+                    say "\n  (cannot read Messages: give your terminal app Full Disk Access)\nAuthentication code: "
+                }
+            } else {
+                set code [string trim $out]
+                if {$code ne ""} {
+                    say "$code (from SMS)\n"
+                    # A retry must wait for a newer SMS, not reuse this one.
+                    set since [clock seconds]
+                    return $code
+                }
+            }
+        }
+        set typed ""
+        if {$::user_input} {
+            expect_user {
+                -timeout 2
+                -re {([^\r\n]*)\r?\n} { set typed [string trim $expect_out(1,string)] }
+                eof { set ::user_input 0 }
+            }
+        } elseif {$sms_helper eq ""} {
+            say "\n  No terminal input and no SMS reader: cannot get the code.\n"
+            exit 2
+        } else {
+            after 2000
+        }
+        if {$typed ne ""} {
+            set since [clock seconds]
+            return $typed
+        }
+    }
+    say "\n  No code within 5 minutes.\n"
+    exit 2
+}
+# Keep the password out of the vpn child's environment.
+unset env(BTVPN_PASS)
+
+set pass_sent 0
+
+spawn $vpn connect $host
+
+expect {
+    -re {>> ([^\r\n]*)\r?\n} {
+        set m [string trim $expect_out(1,string)]
+        # The tunnel belongs to the Secure Client service, so leaving the CLI here keeps it up.
+        if {[regexp {^state: Connected} $m]} { exit 0 }
+        if {[regexp {Login failed} $m]} {
+            say "  $m\n"
+            exit 1
+        }
+        # Show what the server says (the auth message text, errors); hide routine state noise.
+        if {$m ne "" && ![regexp {^(state:|notice:|registered|contacting|Authentication Message)} $m]} {
+            say "  $m\n"
+        }
+        exp_continue
+    }
+    -re {Group: (\[[^\]]*\] ?)?} {
+        # Asked only when the VPN entry does not fix the group. BTVPN_GROUP answers it;
+        # an empty answer accepts the default the server shows in brackets.
+        send -- "$group\r"
+        exp_continue
+    }
+    -re {Username: (\[[^\]]*\] )?} {
+        if {$pass_sent} {
+            say "  The server asked for the username again: login was rejected.\n"
+            exit 1
+        }
+        send -- "$user\r"
+        exp_continue
+    }
+    -re {(Second )?Password: ?} {
+        if {$pass_sent} {
+            say "  The server asked for the password again: wrong password?\n"
+            exit 1
+        }
+        set pass_sent 1
+        send -- "$pass\r"
+        exp_continue
+    }
+    -re {Answer: ?} {
+        if {$second ne ""} {
+            set code $second
+            set second ""
+        } else {
+            # The code is sent only after the password is accepted, so wait for it now.
+            set code [wait_for_code]
+        }
+        send -- "$code\r"
+        exp_continue
+    }
+    -re {\[y/n\]:? ?} {
+        # Login banner acceptance.
+        send -- "y\r"
+        exp_continue
+    }
+    timeout {
+        say "  Timed out waiting for the VPN client.\n"
+        exit 2
+    }
+    eof {}
+}
+
+# The client ended without reporting Connected; btvpn checks the real state next.
+exit 2

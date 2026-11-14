@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+#
+# mbm-sync-git-msp — Sync local git-msp folder to remote host via rsync
+#
+# Usage:
+#   mbm-sync-git-msp              # normal sync
+#   mbm-sync-git-msp --dry-run    # preview changes, don't touch anything
+#   mbm-sync-git-msp --watch      # auto-sync on file changes (requires fswatch)
+#   mbm-sync-git-msp --help       # show help
+#
+
+set -euo pipefail
+
+# ─── Configuration ──────────────────────────────────────────────────────────
+SOURCE_DIR="${MBM_SYNC_SOURCE_DIR:-$HOME/git-msp/}"
+REMOTE_USER="${MBM_REMOTE_USER:-$USER}"
+REMOTE_HOST="${MBM_REMOTE_HOST:-}"
+REMOTE_DIR="${MBM_SYNC_REMOTE_DIR:-git-msp/}"
+
+# SSH options (uncomment and adjust if needed)
+# SSH_PORT=22
+# SSH_KEY="$HOME/.ssh/id_ed25519"
+# SSH_OPTS="-e \"ssh -p ${SSH_PORT} -i ${SSH_KEY}\""
+
+# Log directory and file
+LOG_DIR="$HOME/.local/log/sync-git-msp"
+LOG_FILE="${LOG_DIR}/sync-$(date +%Y-%m-%d).log"
+
+# Exclude patterns — adjust to taste
+EXCLUDES=(
+  --exclude='.git/'
+  --exclude='node_modules/'
+  --exclude='.next/'
+  --exclude='.nuxt/'
+  --exclude='dist/'
+  --exclude='build/'
+  --exclude='out/'
+  --exclude='__pycache__/'
+  --exclude='*.pyc'
+  --exclude='.venv/'
+  --exclude='venv/'
+  --exclude='.env'
+  --exclude='.env.local'
+  --exclude='vendor/'
+  --exclude='.DS_Store'
+  --exclude='*.log'
+  --exclude='.idea/'
+  --exclude='.vscode/'
+  --exclude='coverage/'
+  --exclude='.cache/'
+)
+
+# ─── Helpers ────────────────────────────────────────────────────────────────
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+BLUE=$'\033[0;34m'
+NC=$'\033[0m'
+
+log() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  local color="$NC"
+  case "$level" in
+    INFO)  color="$BLUE"   ;;
+    OK)    color="$GREEN"  ;;
+    WARN)  color="$YELLOW" ;;
+    ERROR) color="$RED"    ;;
+  esac
+  # Print to terminal (colored) and to log file (plain)
+  printf '%s[%s] [%s]%s %s\n' "$color" "$ts" "$level" "$NC" "$msg"
+  printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE"
+}
+
+show_help() {
+  cat <<EOF
+mbm-sync-git-msp — Sync ${SOURCE_DIR} → ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}
+
+Usage:
+  $0              Normal sync (mirror with --delete)
+  $0 --dry-run    Preview changes without modifying anything
+  $0 --watch      Continuously watch for changes and auto-sync (needs fswatch)
+  $0 --help       Show this help
+
+Logs are written to: ${LOG_DIR}/
+EOF
+}
+
+run_sync() {
+  local extra_flags=("$@")
+  local rsync_cmd=(
+    rsync
+    -avz
+    --human-readable
+    --stats
+    --delete
+    "${EXCLUDES[@]}"
+    "${extra_flags[@]}"
+    "$SOURCE_DIR"
+    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
+  )
+
+  log INFO "Starting rsync: ${SOURCE_DIR} → ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
+  log INFO "Command: ${rsync_cmd[*]}"
+
+  local start_ts end_ts duration
+  start_ts=$(date +%s)
+
+  # Run rsync, tee output to both terminal and log file
+  if "${rsync_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+    end_ts=$(date +%s)
+    duration=$((end_ts - start_ts))
+    log OK "Sync completed successfully in ${duration}s"
+    return 0
+  else
+    local rc=${PIPESTATUS[0]}
+    end_ts=$(date +%s)
+    duration=$((end_ts - start_ts))
+    log ERROR "Sync failed with exit code ${rc} after ${duration}s"
+    return "$rc"
+  fi
+}
+
+watch_mode() {
+  if ! command -v fswatch >/dev/null 2>&1; then
+    log ERROR "fswatch is required for --watch mode. Install with: brew install fswatch"
+    exit 1
+  fi
+
+  log INFO "Watch mode active. Monitoring ${SOURCE_DIR} for changes... (Ctrl+C to stop)"
+
+  # Initial sync on start
+  run_sync || log WARN "Initial sync failed, continuing to watch..."
+
+  # Build a fswatch exclude regex from the rsync excludes (best-effort)
+  fswatch -o \
+    --exclude='\.git/' \
+    --exclude='node_modules/' \
+    --exclude='\.next/' \
+    --exclude='dist/' \
+    --exclude='build/' \
+    --exclude='__pycache__/' \
+    --exclude='\.venv/' \
+    --exclude='\.DS_Store' \
+    "$SOURCE_DIR" \
+  | while read -r _; do
+      log INFO "Change detected, syncing..."
+      run_sync || log WARN "Sync failed, will retry on next change"
+    done
+}
+
+if [[ -z "$REMOTE_HOST" && "${1:-}" != "-h" && "${1:-}" != "--help" ]]; then
+  echo "No remote host is set. Export MBM_REMOTE_HOST (for example in the local.env file of your installation)." >&2
+  exit 1
+fi
+
+# ─── Main ───────────────────────────────────────────────────────────────────
+mkdir -p "$LOG_DIR"
+
+# Sanity check
+if [[ ! -d "$SOURCE_DIR" ]]; then
+  log ERROR "Source directory does not exist: $SOURCE_DIR"
+  exit 1
+fi
+
+case "${1:-}" in
+  -h|--help)
+    show_help
+    ;;
+  -n|--dry-run)
+    log INFO "DRY RUN — no changes will be made"
+    run_sync --dry-run
+    ;;
+  -w|--watch)
+    watch_mode
+    ;;
+  '')
+    run_sync
+    ;;
+  *)
+    log ERROR "Unknown option: $1"
+    show_help
+    exit 1
+    ;;
+esac

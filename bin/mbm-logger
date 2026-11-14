@@ -1,0 +1,8 @@
+#!/bin/bash
+# mbm-logger
+# Log everything you do in Terminal.
+
+#* Formatted date & time string.
+FORMATTED_DATE=`/bin/date "+%Y-%m-%d%H%M%S"`
+/usr/bin/script  ~/Documents/Temp/TerminalLogs/terminal_$FORMATTED_DATE.log
+

@@ -1,0 +1,154 @@
+#!/bin/bash
+
+# Default values
+DEFAULT_SPARSEBUNDLE_NAME="LimaData"
+DEFAULT_VOLUME="${MBM_LIMA_VOLUME:-External}"
+
+# Initialize variables with defaults
+SPARSEBUNDLE_NAME="$DEFAULT_SPARSEBUNDLE_NAME"
+VOLUME="$DEFAULT_VOLUME"
+
+# Function to display usage
+usage() {
+    echo "Lima Podman Setup Script"
+    echo "========================"
+    echo ""
+    echo "This script sets up Lima with Podman by mounting a sparsebundle and configuring connections."
+    echo ""
+    echo "Usage: $0 [-e sparsebundle_name] [-v volume_name] [-h]"
+    echo ""
+    echo "Options:"
+    echo "  -e: Sparsebundle name (default: $DEFAULT_SPARSEBUNDLE_NAME)"
+    echo "  -v: Volume name where sparsebundle is located (default: $DEFAULT_VOLUME)"
+    echo "  -h: Display this help message"
+    echo ""
+    echo "Examples:"
+    echo "  # Use defaults ($DEFAULT_VOLUME volume, $DEFAULT_SPARSEBUNDLE_NAME sparsebundle)"
+    echo "  $0"
+    echo ""
+    echo "  # Use different volume where sparsebundle is stored"
+    echo "  $0 -v MyExternalDrive"
+    echo ""
+    echo "  # Use different sparsebundle name"
+    echo "  $0 -e MyLimaData"
+    echo ""
+    echo "  # Use both custom volume and sparsebundle name"
+    echo "  $0 -v MyExternalDrive -e MyLimaData"
+    echo ""
+    echo "  # This would look for: /Volumes/MyExternalDrive/MyLimaData.sparsebundle"
+    echo "  # And mount it as: /Volumes/MyLimaData"
+    echo ""
+    echo "What this script does:"
+    echo "  1. Attaches sparsebundle from /Volumes/{volume}/{sparsebundle}.sparsebundle"
+    echo "  2. Sets LIMA_HOME to /Volumes/{sparsebundle}"
+    echo "  3. Starts limactl podman"
+    echo "  4. Configures podman system connection"
+    echo "  5. Tests the setup with a hello container"
+    echo ""
+    exit 1
+}
+
+# Parse command line options
+while getopts "e:v:h" opt; do
+    case $opt in
+        e)
+            SPARSEBUNDLE_NAME="$OPTARG"
+            ;;
+        v)
+            VOLUME="$OPTARG"
+            ;;
+        h)
+            usage
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            usage
+            ;;
+        :)
+            echo "Option -$OPTARG requires an argument." >&2
+            usage
+            ;;
+    esac
+done
+
+# Construct paths
+SPARSEBUNDLE_PATH="/Volumes/$VOLUME/$SPARSEBUNDLE_NAME.sparsebundle"
+LIMA_HOME_PATH="/Volumes/$SPARSEBUNDLE_NAME"
+
+echo "Using volume: $VOLUME"
+echo "Using sparsebundle name: $SPARSEBUNDLE_NAME"
+echo "Full sparsebundle path: $SPARSEBUNDLE_PATH"
+echo "Lima home will be: $LIMA_HOME_PATH"
+
+# Check if sparsebundle exists
+if [ ! -e "$SPARSEBUNDLE_PATH" ]; then
+    echo "Error: Sparsebundle '$SPARSEBUNDLE_PATH' not found."
+    read -p "Enter the new path to create the sparsebundle: " NEW_SPARSEBUNDLE_PATH
+    
+    if [ -z "$NEW_SPARSEBUNDLE_PATH" ]; then
+        echo "Error: No path provided. Exiting."
+        exit 1
+    fi
+    
+    # Create the sparsebundle (you may need to adjust size and other parameters)
+    echo "Creating sparsebundle at: $NEW_SPARSEBUNDLE_PATH"
+    hdiutil create -size 50g -type SPARSEBUNDLE -fs "Case-sensitive APFS" -volname "$SPARSEBUNDLE_NAME" "$NEW_SPARSEBUNDLE_PATH"
+    
+    if [ $? -eq 0 ]; then
+        SPARSEBUNDLE_PATH="$NEW_SPARSEBUNDLE_PATH"
+        echo "Sparsebundle created successfully."
+    else
+        echo "Error: Failed to create sparsebundle. Exiting."
+        exit 1
+    fi
+fi
+
+# Attach the sparsebundle
+echo "Attaching sparsebundle..."
+hdiutil attach "$SPARSEBUNDLE_PATH"
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to attach sparsebundle. Exiting."
+    exit 1
+fi
+
+# Set LIMA_HOME environment variable
+export LIMA_HOME="$LIMA_HOME_PATH"
+echo "Set LIMA_HOME to: $LIMA_HOME"
+
+# Start limactl with podman
+echo "Starting limactl podman..."
+limactl start podman
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to start limactl podman. Exiting."
+    exit 1
+fi
+
+# Add podman system connection
+echo "Adding podman system connection..."
+podman system connection add lima-podman "unix://$LIMA_HOME_PATH/podman/sock/podman.sock"
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to add podman system connection. Exiting."
+    exit 1
+fi
+
+# Set default connection
+echo "Setting default podman connection..."
+podman system connection default lima-podman
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to set default podman connection. Exiting."
+    exit 1
+fi
+
+# Test the setup
+echo "Testing podman setup..."
+podman run quay.io/podman/hello
+
+if [ $? -eq 0 ]; then
+    echo "Setup completed successfully!"
+else
+    echo "Warning: Test run failed. Please check the setup manually."
+fi

@@ -1,0 +1,16 @@
+#!/bin/zsh
+
+# Check if the correct number of arguments is provided
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <starting-point> <filename>"
+    exit 1
+fi
+
+# Assigning arguments to variables for better readability
+starting_point=$1
+filename=$2
+
+# Using find command to search for the file
+find "$starting_point" -name "$filename" 2>/dev/null
+
+

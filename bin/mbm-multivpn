@@ -1,0 +1,653 @@
+#!/bin/bash
+# mbm-multivpn - keep two Cisco AnyConnect sites up at the same time on this Mac.
+#
+#   company    your everyday VPN, held by Cisco Secure Client through mbm-btvpn, as the split
+#              tunnel (set it up first: mbm-btvpn setup).
+#   training   a second AnyConnect server (for example a Cisco DevNet sandbox reservation),
+#              held by openconnect, because Secure Client keeps one session per machine.
+#
+# Modes for the training tunnel (TRAINING_MODE):
+#   proxy    default. No tunnel interface, no route, no DNS change, no sudo: the training
+#            network is served on 127.0.0.1 as a SOCKS5 proxy plus optional port forwards
+#            (openconnect --script-tun with ocproxy; install once: brew install ocproxy).
+#            Needed next to Secure Client: it deletes every route that falls inside the ranges
+#            its own tunnel claims (seen with a company tunnel claiming 10/8, 172.16/12, 192.168/16).
+#   routes   a real utun interface with kernel routes (sudo). Any program reaches the training
+#            network without a proxy, but only for networks the company tunnel does not claim.
+#
+# Usage:
+#   mbm-multivpn up                      company (split), then training
+#   mbm-multivpn down                    training, then company
+#   mbm-multivpn status                  both tunnels, with a live reachability test of the training side
+#   mbm-multivpn check                   what is installed, set and reachable, before connecting
+#   mbm-multivpn company up|down
+#   mbm-multivpn training up|down
+#   mbm-multivpn training set [server[:port]] [user]
+#                                    save the server and user, store the password in the Keychain
+#                                    (a DevNet sandbox gives a new address and login per reservation)
+#   mbm-multivpn training browser [url]  a separate Chrome window whose traffic goes through the proxy
+#   mbm-multivpn training log            the last lines openconnect wrote
+#
+# Using the proxy (default port 11080):
+#   curl      curl --proxy socks5h://127.0.0.1:11080 -k https://10.10.20.60/
+#   ssh       ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:11080 %h %p' user@10.10.20.60
+#   env       ALL_PROXY=socks5h://127.0.0.1:11080   (programs that honour it)
+#   forward   TRAINING_FORWARDS="8443:10.10.20.60:443"  ->  https://127.0.0.1:8443/ for any program
+#
+# Option for up / training up, routes mode only:
+#   -f            connect although the company tunnel is a full tunnel
+#
+# Settings, in ~/.config/multivpn/multivpn.conf (written by "training set", shell syntax):
+#   TRAINING_SERVER      host[:port]
+#   TRAINING_USER        login name
+#   TRAINING_MODE        proxy | routes
+#   TRAINING_SOCKS_PORT  proxy mode: SOCKS5 port on 127.0.0.1 (default 11080)
+#   TRAINING_FORWARDS    proxy mode: space-separated lport:host:rport, each served on 127.0.0.1
+#   TRAINING_ROUTES      routes mode: space-separated CIDRs; empty = the list the server sends
+#   TRAINING_PROBE       host:port inside the training network, tested by "status"
+#                        (empty = the first DNS server the training side offers, port 53)
+#   TRAINING_GROUP       AnyConnect group, when the server asks for one
+#   TRAINING_SERVERCERT  pin-sha256:... for a server certificate that does not verify
+#
+# Bash 3.2 compatible (the macOS /bin/bash).
+
+set -u
+
+# The real location of this file, through the symlink the installer made, and the name it
+# was called by (the installer may have given the commands another prefix than mbm-).
+ME="$(basename "$0")"
+SELF="$0"
+while [ -L "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+LIBEXEC="$(cd "$SELF_DIR/../libexec" 2>/dev/null && pwd)"
+BTVPN="$SELF_DIR/mbm-btvpn"
+ROUTE_HOOK="$LIBEXEC/multivpn-routes"
+PROXY_HOOK="$LIBEXEC/multivpn-proxy"
+# Secure Client 5 first, then the older AnyConnect 4 layout.
+VPN=/opt/cisco/secureclient/bin/vpn
+[ -x "$VPN" ] || [ ! -x /opt/cisco/anyconnect/bin/vpn ] || VPN=/opt/cisco/anyconnect/bin/vpn
+CONF="${MULTIVPN_CONF:-$HOME/.config/multivpn/multivpn.conf}"
+KC_SERVICE="multivpn-training"
+LOG="$HOME/Library/Logs/multivpn-training.log"
+# routes mode: openconnect runs as root.
+PIDFILE=/var/run/multivpn-training.pid
+STATEFILE=/var/run/multivpn-training.state
+# proxy mode: openconnect runs as this user.
+RUN_DIR="$HOME/.config/multivpn/run"
+UPIDFILE="$RUN_DIR/training.pid"
+USTATEFILE="$RUN_DIR/training.state"
+
+die() { echo "$ME: $*" >&2; exit 1; }
+
+TRAINING_SERVER=""
+TRAINING_USER=""
+TRAINING_MODE="proxy"
+TRAINING_SOCKS_PORT="11080"
+TRAINING_FORWARDS=""
+TRAINING_ROUTES=""
+TRAINING_PROBE=""
+TRAINING_GROUP=""
+TRAINING_SERVERCERT=""
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+# Checked once here: most readers of these run inside $(...), where die cannot stop the script.
+case "$TRAINING_MODE" in
+  proxy|routes) ;;
+  *) die "TRAINING_MODE must be proxy or routes, got: $TRAINING_MODE ($CONF)" ;;
+esac
+[[ "$TRAINING_SOCKS_PORT" =~ ^[0-9]{2,5}$ ]] || die "TRAINING_SOCKS_PORT: not a port: $TRAINING_SOCKS_PORT ($CONF)"
+for _r in $TRAINING_ROUTES; do
+  [[ "$_r" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] \
+    || die "TRAINING_ROUTES: not a CIDR (a.b.c.d/len): $_r ($CONF)"
+done
+for _f in $TRAINING_FORWARDS; do
+  [[ "$_f" =~ ^[0-9]{2,5}:[A-Za-z0-9._-]+:[0-9]{1,5}$ ]] \
+    || die "TRAINING_FORWARDS: not lport:host:rport: $_f ($CONF)"
+done
+
+# ---------------------------------------------------------------- CIDR arithmetic
+
+ip2int() { local IFS=.; set -- $1; echo $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 )); }
+int2ip() { echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"; }
+len2mask() { if [ "$1" -eq 0 ]; then echo 0; else echo $(( (0xffffffff << (32 - $1)) & 0xffffffff )); fi; }
+
+# 0 when the two networks share any address.
+cidr_overlap() {
+  local al="${1#*/}" bl="${2#*/}" l m
+  if [ "$al" -lt "$bl" ]; then l="$al"; else l="$bl"; fi
+  m="$(len2mask "$l")"
+  [ $(( $(ip2int "${1%/*}") & m )) -eq $(( $(ip2int "${2%/*}") & m )) ]
+}
+
+# An address inside the network, to ask the kernel which interface it would use.
+cidr_first_host() {
+  local len="${1#*/}" net
+  net=$(( $(ip2int "${1%/*}") & $(len2mask "$len") ))
+  if [ "$len" -ge 31 ]; then int2ip "$net"; else int2ip $(( net + 1 )); fi
+}
+
+route_owner() { /sbin/route -n get "$1" 2>/dev/null | sed -n 's/^ *interface: *//p' | head -n 1; }
+
+listening() { nc -z -G 2 127.0.0.1 "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- company (Secure Client, btvpn)
+
+STATS=""
+load_stats() { [ -n "$STATS" ] || STATS="$("$VPN" stats 2>/dev/null | tr -d '\r')"; }
+stat_field() {
+  load_stats
+  printf '%s\n' "$STATS" | sed -n "s/^ *$1: *//p" | head -n 1 | sed 's/ *$//'
+}
+company_state() { stat_field "Connection State"; }
+
+# split | full | unknown
+company_mode() {
+  case "$(stat_field "Tunnel Mode (IPv4)")" in
+    "Split Include"*) echo split ;;
+    "Tunnel All"*|"Split Exclude"*) echo full ;;
+    *) echo unknown ;;
+  esac
+}
+
+# The routes Secure Client sends into the company tunnel, one CIDR per line.
+company_routes() {
+  load_stats
+  printf '%s\n' "$STATS" | awk '
+    /^\[ Secured Routes \(IPv4\) \]/ { on = 1; next }
+    /^\[/ { on = 0 }
+    on && $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $2 ~ /^[0-9]+$/ { print $1 "/" $2 }'
+}
+
+iface_of_addr() {
+  /sbin/ifconfig | awk -v ip="$1" '
+    /^[a-z0-9]+:/ { dev = $1; sub(":", "", dev) }
+    $1 == "inet" && $2 == ip { print dev; exit }'
+}
+
+company_up() {
+  [ -x "$BTVPN" ] || die "btvpn not found at $BTVPN"
+  if [ "$(company_state)" = "Connected" ]; then
+    [ "$(company_mode)" = "split" ] || die "the company tunnel is up but not as a split tunnel ($(stat_field "Tunnel Mode (IPv4)")).
+  Run: $ME company down   then: $ME up"
+    echo "Company: already connected (split tunnel)."
+    return 0
+  fi
+  "$BTVPN" connect split || die "the company tunnel did not come up"
+  STATS=""
+}
+
+company_down() {
+  [ -x "$BTVPN" ] || die "btvpn not found at $BTVPN"
+  "$BTVPN" disconnect
+  STATS=""
+}
+
+# ---------------------------------------------------------------- training: shared
+
+find_tool() {
+  command -v "$1" 2>/dev/null && return 0
+  for p in "/opt/homebrew/bin/$1" "/usr/local/bin/$1"; do
+    [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# host[:port], without scheme or path.
+training_server() {
+  local s="${MULTIVPN_TRAINING_SERVER:-$TRAINING_SERVER}"
+  s="${s#https://}"
+  echo "${s%%/*}"
+}
+
+kc_password() { security find-generic-password -s "$KC_SERVICE" -a "$1" -w 2>/dev/null; }
+
+# state_get FILE KEY
+state_get() { [ -r "$1" ] && sed -n "s/^$2=//p" "$1" | head -n 1; }
+
+# The pid in a pid file, when that process is an openconnect.
+pid_of() {
+  local pid
+  [ -r "$1" ] || return 1
+  pid="$(head -n 1 "$1" 2>/dev/null | tr -cd '0-9')"
+  [ -n "$pid" ] || return 1
+  case "$(ps -p "$pid" -o comm= 2>/dev/null)" in
+    *openconnect*) echo "$pid" ;;
+    *) return 1 ;;
+  esac
+}
+proxy_pid() { pid_of "$UPIDFILE"; }
+routes_pid() { pid_of "$PIDFILE"; }
+training_is_up() { proxy_pid >/dev/null || routes_pid >/dev/null; }
+
+# Sets T_OC, T_SERVER, T_USER, T_PASS, or stops.
+training_login() {
+  T_OC="$(find_tool openconnect)" || die "openconnect is not installed. Run: brew install openconnect"
+  T_SERVER="$(training_server)"
+  [ -n "$T_SERVER" ] || die "no training server; run: $ME training set <server[:port]> <user>"
+  T_USER="${MULTIVPN_TRAINING_USER:-$TRAINING_USER}"
+  [ -n "$T_USER" ] || die "no training user; run: $ME training set $T_SERVER <user>"
+  T_PASS="$(kc_password "$T_USER")"
+  if [ -z "$T_PASS" ]; then
+    printf "Training password for %s: " "$T_USER"
+    stty -echo; read -r T_PASS; stty echo; echo
+  fi
+  [ -n "$T_PASS" ] || die "empty password"
+}
+
+show_log_and_die() {
+  tail -n 15 "$LOG" | sed 's/^/  /' >&2
+  die "$1 (full log: $LOG)"
+}
+
+# ---------------------------------------------------------------- training: proxy mode
+
+training_up_proxy() {
+  local ocproxy rc i f lport
+  ocproxy="$(find_tool ocproxy)" || die "ocproxy is not installed. Run: brew install ocproxy"
+  [ -x "$PROXY_HOOK" ] || die "proxy hook not found or not executable: $PROXY_HOOK"
+  training_login
+  listening "$TRAINING_SOCKS_PORT" && die "port $TRAINING_SOCKS_PORT on 127.0.0.1 is already in use (TRAINING_SOCKS_PORT)"
+  for f in $TRAINING_FORWARDS; do
+    lport="${f%%:*}"
+    listening "$lport" && die "port $lport on 127.0.0.1 is already in use (TRAINING_FORWARDS $f)"
+  done
+
+  echo "Training: connecting to $T_SERVER as $T_USER (proxy mode, no sudo)..."
+  mkdir -p "$RUN_DIR" "$(dirname "$LOG")"
+  rm -f "$USTATEFILE" "$UPIDFILE"
+  : > "$LOG"
+
+  set -- "$T_OC" --protocol=anyconnect --user="$T_USER" --passwd-on-stdin --background \
+    --pid-file="$UPIDFILE" --script-tun --script="$PROXY_HOOK"
+  [ -n "$TRAINING_GROUP" ] && set -- "$@" --authgroup="$TRAINING_GROUP"
+  [ -n "$TRAINING_SERVERCERT" ] && set -- "$@" --servercert="$TRAINING_SERVERCERT"
+  set -- "$@" "$T_SERVER"
+
+  # The password goes through stdin only (never argv).
+  printf '%s\n' "$T_PASS" | /usr/bin/env LC_ALL=C MULTIVPN_STATE="$USTATEFILE" MULTIVPN_OCPROXY="$ocproxy" \
+    MULTIVPN_SOCKS_PORT="$TRAINING_SOCKS_PORT" MULTIVPN_FORWARDS="$TRAINING_FORWARDS" \
+    "$@" >> "$LOG" 2>&1
+  rc=$?
+  T_PASS=""
+  [ "$rc" -eq 0 ] || show_log_and_die "openconnect exited $rc"
+
+  i=0
+  while [ "$i" -lt 20 ]; do
+    proxy_pid >/dev/null && listening "$TRAINING_SOCKS_PORT" && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  show_log_and_die "the proxy on 127.0.0.1:$TRAINING_SOCKS_PORT did not come up within 20 s"
+}
+
+training_down_proxy() {
+  local pid i
+  pid="$(proxy_pid)" || return 0
+  kill -INT "$pid" 2>/dev/null
+  i=0
+  while [ "$i" -lt 10 ] && proxy_pid >/dev/null; do sleep 1; i=$((i + 1)); done
+  proxy_pid >/dev/null && die "openconnect (pid $pid) is still running"
+  rm -f "$USTATEFILE" "$UPIDFILE"
+  echo "Training: disconnected (proxy)."
+}
+
+# The host:port "status" tests through the proxy.
+proxy_probe_target() {
+  local dns
+  if [ -n "$TRAINING_PROBE" ]; then echo "$TRAINING_PROBE"; return 0; fi
+  dns="$(state_get "$USTATEFILE" DNS_OFFERED)"
+  [ -n "$dns" ] && echo "${dns%% *}:53"
+}
+
+status_proxy() {
+  local pid port f lport target rc=0
+  pid="$(proxy_pid)"
+  port="$(state_get "$USTATEFILE" SOCKS_PORT)"
+  port="${port:-$TRAINING_SOCKS_PORT}"
+  echo "Training  Connected (openconnect + ocproxy, pid $pid; no interface, no routes)"
+  echo "  client $(state_get "$USTATEFILE" ADDRESS)   server $(training_server)"
+  if listening "$port"; then
+    echo "  SOCKS5    127.0.0.1:$port   listening"
+  else
+    echo "  SOCKS5    127.0.0.1:$port   NOT listening"; rc=1
+  fi
+  for f in $(state_get "$USTATEFILE" FORWARDS); do
+    lport="${f%%:*}"
+    if listening "$lport"; then
+      echo "  forward   127.0.0.1:$lport -> ${f#*:}   listening"
+    else
+      echo "  forward   127.0.0.1:$lport -> ${f#*:}   NOT listening"; rc=1
+    fi
+  done
+  echo "  networks  $(state_get "$USTATEFILE" NETWORKS)"
+  [ -n "$(state_get "$USTATEFILE" DNS_OFFERED)" ] && \
+    echo "  DNS       $(state_get "$USTATEFILE" DNS_OFFERED) $(state_get "$USTATEFILE" DOMAIN_OFFERED)   (used by the proxy for socks5h names only)"
+  target="$(proxy_probe_target)"
+  if [ -n "$target" ]; then
+    if nc -X 5 -x "127.0.0.1:$port" -z -G 6 "${target%%:*}" "${target##*:}" >/dev/null 2>&1; then
+      echo "  probe     $target through the proxy: reachable"
+    else
+      echo "  probe     $target through the proxy: NOT reachable"; rc=1
+    fi
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- training: routes mode
+
+# Stop when the company tunnel would swallow the training routes.
+guard_company_mode() {
+  local force="$1"
+  [ "$(company_state)" = "Connected" ] || return 0
+  [ "$(company_mode)" = "split" ] && return 0
+  [ "$force" = 1 ] && { echo "Warning: the company tunnel is not a split tunnel; continuing because of -f."; return 0; }
+  die "the company tunnel is a full tunnel ($(stat_field "Tunnel Mode (IPv4)")): Secure Client sends every
+  route into it, so a second tunnel's routes do not hold. Use TRAINING_MODE=proxy, or -f to connect anyway."
+}
+
+training_up_routes() {
+  local rc i
+  [ -x "$ROUTE_HOOK" ] || die "route hook not found or not executable: $ROUTE_HOOK"
+  training_login
+
+  echo "Training: connecting to $T_SERVER as $T_USER (routes mode; sudo creates the tunnel interface)..."
+  sudo -v || die "sudo was refused"
+  sudo rm -f "$STATEFILE"
+  mkdir -p "$(dirname "$LOG")"
+  : > "$LOG"
+
+  set -- "$T_OC" --protocol=anyconnect --user="$T_USER" --passwd-on-stdin --background \
+    --pid-file="$PIDFILE" --script="$ROUTE_HOOK"
+  [ -n "$TRAINING_GROUP" ] && set -- "$@" --authgroup="$TRAINING_GROUP"
+  [ -n "$TRAINING_SERVERCERT" ] && set -- "$@" --servercert="$TRAINING_SERVERCERT"
+  set -- "$@" "$T_SERVER"
+
+  # The password goes through stdin only (never argv); the routes reach the hook through env.
+  printf '%s\n' "$T_PASS" | sudo /usr/bin/env LC_ALL=C MULTIVPN_ROUTES="$TRAINING_ROUTES" \
+    MULTIVPN_STATE="$STATEFILE" "$@" >> "$LOG" 2>&1
+  rc=$?
+  T_PASS=""
+  [ "$rc" -eq 0 ] || show_log_and_die "openconnect exited $rc"
+
+  i=0
+  while [ "$i" -lt 20 ]; do
+    [ -r "$STATEFILE" ] && routes_pid >/dev/null && return 0
+    sleep 1
+    i=$((i + 1))
+  done
+  show_log_and_die "the training tunnel did not come up within 20 s"
+}
+
+training_down_routes() {
+  local pid i
+  pid="$(routes_pid)" || return 0
+  echo "Training: disconnecting the routed tunnel (sudo)..."
+  sudo kill -INT "$pid" || die "could not signal openconnect (pid $pid)"
+  i=0
+  while [ "$i" -lt 10 ] && routes_pid >/dev/null; do sleep 1; i=$((i + 1)); done
+  routes_pid >/dev/null && die "openconnect (pid $pid) is still running"
+  [ -e "$STATEFILE" ] && sudo rm -f "$STATEFILE"
+  echo "Training: disconnected (routes)."
+}
+
+# One line per training route: what the company tunnel claims around it, and the interface the
+# kernel really uses for it. Returns 1 when a route does not go through the training tunnel.
+explain_routes() {
+  local dev="$1" routes="$2" company r c wider narrower same host owner line bad=0
+  company="$(company_routes)"
+  for r in $routes; do
+    wider=""; narrower=""; same=""
+    for c in $company; do
+      cidr_overlap "$r" "$c" || continue
+      if [ "${c#*/}" -lt "${r#*/}" ]; then wider="${wider:-$c}"
+      elif [ "${c#*/}" -eq "${r#*/}" ]; then same="$c"
+      else narrower="$narrower $c"; fi
+    done
+    line="$(printf '    %-18s' "$r")"
+    if [ -n "$dev" ]; then
+      host="$(cidr_first_host "$r")"
+      owner="$(route_owner "$host")"
+      if [ "$owner" = "$dev" ]; then
+        line="$line ok, through $dev"
+      else
+        line="$line NOT through $dev: the kernel sends $host through ${owner:-no interface}"
+        bad=1
+      fi
+    fi
+    if [ -n "$same" ]; then
+      line="$line   [CONFLICT: the company tunnel has this same route]"
+      [ -n "$dev" ] || bad=1
+    elif [ -n "$wider" ]; then
+      line="$line   [inside the company route $wider: Secure Client deletes such a route]"
+      [ -n "$dev" ] || bad=1
+    fi
+    [ -n "$narrower" ] && line="$line   [the company keeps:$narrower]"
+    echo "$line"
+  done
+  return "$bad"
+}
+
+status_routes() {
+  local pid dev routes target rc=0
+  pid="$(routes_pid)"
+  dev="$(state_get "$STATEFILE" TUNDEV)"
+  routes="$(state_get "$STATEFILE" ROUTES)"
+  echo "Training  Connected (openconnect, routes mode, pid $pid)"
+  echo "  interface $dev   client $(state_get "$STATEFILE" ADDRESS)   server $(training_server)"
+  echo "  routes    ($(state_get "$STATEFILE" ROUTE_SOURCE))"
+  if [ -n "$routes" ]; then
+    explain_routes "$dev" "$routes" || rc=1
+  else
+    echo "    none: set TRAINING_ROUTES in $CONF"; rc=1
+  fi
+  [ -n "$(state_get "$STATEFILE" SKIPPED)" ] && { echo "  not added: $(state_get "$STATEFILE" SKIPPED)"; rc=1; }
+  [ -n "$(state_get "$STATEFILE" DNS_OFFERED)" ] && \
+    echo "  DNS offered by the server, not applied: $(state_get "$STATEFILE" DNS_OFFERED) $(state_get "$STATEFILE" DOMAIN_OFFERED)"
+  target="$TRAINING_PROBE"
+  if [ -n "$target" ]; then
+    if nc -z -G 4 "${target%%:*}" "${target##*:}" >/dev/null 2>&1; then
+      echo "  probe     $target: reachable (through $(route_owner "${target%%:*}"))"
+    else
+      echo "  probe     $target: NOT reachable (the kernel sends it through $(route_owner "${target%%:*}"))"; rc=1
+    fi
+  fi
+  [ "$rc" -eq 0 ] || echo "  The routed tunnel is not carrying the training traffic. Run: $ME training down
+  then connect in proxy mode (TRAINING_MODE=proxy, the default): $ME training up"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------- reports
+
+status_company() {
+  local state addr
+  state="$(company_state)"
+  if [ "$state" != "Connected" ]; then
+    echo "Company   ${state:-unknown}"
+    return 0
+  fi
+  addr="$(stat_field "Client Address (IPv4)")"
+  echo "Company   Connected, $(stat_field "Tunnel Mode (IPv4)") (Cisco Secure Client, btvpn)"
+  echo "  interface $(iface_of_addr "$addr")   client $addr   server $(stat_field "Server Address")"
+  echo "  routes    $(company_routes | tr '\n' ' ')"
+}
+
+status_training() {
+  local rc=0
+  if ! training_is_up; then
+    echo "Training  Disconnected ($TRAINING_MODE mode; server $(training_server))"
+    return 0
+  fi
+  if proxy_pid >/dev/null; then status_proxy || rc=1; fi
+  if routes_pid >/dev/null; then status_routes || rc=1; fi
+  return "$rc"
+}
+
+cmd_status() {
+  local rc=0
+  status_company
+  status_training || rc=1
+  return "$rc"
+}
+
+cmd_check() {
+  local bad=0 server host port user f
+  line() { printf '  %-5s %s\n' "$1" "$2"; [ "$1" = "FAIL" ] && bad=1; return 0; }
+
+  echo "Company (Cisco Secure Client through btvpn)"
+  if [ -x "$VPN" ]; then line ok "Secure Client CLI: $VPN"; else line FAIL "Secure Client CLI missing: $VPN"; fi
+  if [ -x "$BTVPN" ]; then line ok "btvpn: $BTVPN"; else line FAIL "btvpn missing: $BTVPN"; fi
+  case "$(company_state)" in
+    Connected)
+      if [ "$(company_mode)" = "split" ]; then line ok "connected, split tunnel"
+      else line warn "connected as $(stat_field "Tunnel Mode (IPv4)"), not split"; fi ;;
+    *) line ok "not connected ($ME up connects it as split)" ;;
+  esac
+
+  echo "Training ($TRAINING_MODE mode)"
+  if find_tool openconnect >/dev/null; then line ok "openconnect: $(find_tool openconnect)"
+  else line FAIL "openconnect missing: brew install openconnect"; fi
+  if [ "$TRAINING_MODE" = "proxy" ]; then
+    if find_tool ocproxy >/dev/null; then line ok "ocproxy: $(find_tool ocproxy)"
+    else line FAIL "ocproxy missing: brew install ocproxy"; fi
+    if [ -x "$PROXY_HOOK" ]; then line ok "proxy hook: $PROXY_HOOK"; else line FAIL "proxy hook missing: $PROXY_HOOK"; fi
+    if proxy_pid >/dev/null; then line ok "SOCKS5 port $TRAINING_SOCKS_PORT: in use by the running training proxy"
+    elif listening "$TRAINING_SOCKS_PORT"; then line FAIL "port $TRAINING_SOCKS_PORT on 127.0.0.1 is in use by something else (TRAINING_SOCKS_PORT)"
+    else line ok "SOCKS5 port $TRAINING_SOCKS_PORT is free"; fi
+    for f in $TRAINING_FORWARDS; do line ok "forward 127.0.0.1:${f%%:*} -> ${f#*:}"; done
+  else
+    if [ -x "$ROUTE_HOOK" ]; then line ok "route hook: $ROUTE_HOOK"; else line FAIL "route hook missing: $ROUTE_HOOK"; fi
+  fi
+  if routes_pid >/dev/null && [ "$TRAINING_MODE" = "proxy" ]; then
+    line warn "a routed training tunnel is still running (pid $(routes_pid)): $ME training down"
+  fi
+  user="${MULTIVPN_TRAINING_USER:-$TRAINING_USER}"
+  if [ -z "$user" ]; then line FAIL "no user: $ME training set <server[:port]> <user>"
+  elif [ -n "$(kc_password "$user")" ]; then line ok "user $user, password in the Keychain"
+  else line warn "user $user, no password in the Keychain (it will be asked)"; fi
+  server="$(training_server)"
+  if [ -z "$server" ]; then
+    line FAIL "no server: $ME training set <server[:port]> <user>"
+  else
+    host="${server%%:*}"; port=443
+    case "$server" in *:*) port="${server##*:}" ;; esac
+    if nc -z -G 4 "$host" "$port" >/dev/null 2>&1; then line ok "server $host:$port answers (through $(route_owner "$host"))"
+    else line FAIL "server $host:$port does not answer"; fi
+  fi
+  if [ "$TRAINING_MODE" = "routes" ] && [ -n "$TRAINING_ROUTES" ]; then
+    echo "  routes to add (TRAINING_ROUTES):"
+    explain_routes "" "$TRAINING_ROUTES" || bad=1
+  fi
+  [ "$bad" -eq 0 ] && echo "Ready." || echo "Fix the FAIL lines first."
+  return "$bad"
+}
+
+cmd_training_up() {
+  local force=0
+  OPTIND=1
+  while getopts "f" opt; do
+    case "$opt" in
+      f) force=1 ;;
+      *) die "unknown option; see: $ME help" ;;
+    esac
+  done
+  if training_is_up; then
+    if [ "$TRAINING_MODE" = "proxy" ] && ! proxy_pid >/dev/null; then
+      die "a routed training tunnel is still running (pid $(routes_pid)). Run: $ME training down   then: $ME training up"
+    fi
+    echo "Training: already connected."
+    status_training
+    return $?
+  fi
+  case "$TRAINING_MODE" in
+    proxy) training_up_proxy ;;
+    routes) guard_company_mode "$force"; training_up_routes ;;
+  esac
+  status_training
+}
+
+cmd_training_down() {
+  if ! training_is_up; then echo "Training: not connected."; return 0; fi
+  training_down_proxy
+  training_down_routes
+}
+
+cmd_training_set() {
+  local server="${1:-}" user="${2:-}"
+  [ -n "$server" ] || server="$(training_server)"
+  if [ -z "$server" ]; then printf "Training server (host[:port]): "; read -r server; fi
+  [ -n "$server" ] || die "a server is required"
+  [ -n "$user" ] || user="$TRAINING_USER"
+  if [ -z "$user" ]; then printf "Training username: "; read -r user; fi
+  [ -n "$user" ] || die "a username is required"
+  server="${server#https://}"; server="${server%%/*}"
+
+  mkdir -p "$(dirname "$CONF")"
+  {
+    echo "# multivpn settings (see: $ME help). Rewritten by: $ME training set"
+    printf 'TRAINING_SERVER=%q\n' "$server"
+    printf 'TRAINING_USER=%q\n' "$user"
+    printf 'TRAINING_MODE=%q\n' "$TRAINING_MODE"
+    printf 'TRAINING_SOCKS_PORT=%q\n' "$TRAINING_SOCKS_PORT"
+    printf 'TRAINING_FORWARDS=%q\n' "$TRAINING_FORWARDS"
+    printf 'TRAINING_ROUTES=%q\n' "$TRAINING_ROUTES"
+    printf 'TRAINING_PROBE=%q\n' "$TRAINING_PROBE"
+    printf 'TRAINING_GROUP=%q\n' "$TRAINING_GROUP"
+    printf 'TRAINING_SERVERCERT=%q\n' "$TRAINING_SERVERCERT"
+  } > "$CONF"
+  chmod 600 "$CONF"
+  echo "Saved $CONF (server $server, user $user)."
+  # -U updates an existing item; -w as the last argument makes security prompt for the password.
+  security add-generic-password -U -s "$KC_SERVICE" -a "$user" -l "multivpn training ($user)" -w \
+    || die "could not save the password to the Keychain"
+  echo "Saved the password for $user in the login Keychain (service $KC_SERVICE)."
+}
+
+# A separate Chrome profile whose traffic (names included) goes through the training proxy.
+cmd_training_browser() {
+  local port
+  proxy_pid >/dev/null || die "the training proxy is not running. Run: $ME training up"
+  port="$(state_get "$USTATEFILE" SOCKS_PORT)"
+  open -na "Google Chrome" --args --user-data-dir="$HOME/.config/multivpn/chrome-profile" \
+    --proxy-server="socks5://127.0.0.1:${port:-$TRAINING_SOCKS_PORT}" --no-first-run ${1:+"$1"} \
+    || die "could not start Google Chrome"
+}
+
+case "${1:-help}" in
+  help|-h|--help) ;;
+  *) [ -x "$VPN" ] || die "Cisco Secure Client is not installed on this Mac ($VPN is missing).
+  Install it first - your IT department gives you the installer - and connect once with its window." ;;
+esac
+
+case "${1:-help}" in
+  up)
+    shift
+    company_up
+    cmd_training_up "$@" ;;
+  down)
+    cmd_training_down
+    company_down ;;
+  status|s) cmd_status ;;
+  check) cmd_check ;;
+  company)
+    case "${2:-}" in
+      up) company_up; status_company ;;
+      down) company_down ;;
+      *) die "usage: $ME company up|down" ;;
+    esac ;;
+  training)
+    case "${2:-}" in
+      up) shift 2; cmd_training_up "$@" ;;
+      down) cmd_training_down ;;
+      set) shift 2; cmd_training_set "$@" ;;
+      browser) shift 2; cmd_training_browser "$@" ;;
+      log) [ -r "$LOG" ] && tail -n 40 "$LOG" || echo "No log yet: $LOG" ;;
+      *) die "usage: $ME training up|down|set|browser|log" ;;
+    esac ;;
+  help|-h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" | sed "s/mbm-multivpn/$ME/g; s/mbm-btvpn/${ME%multivpn}btvpn/g" ;;
+  *) die "unknown command: $1 (try: $ME help)" ;;
+esac

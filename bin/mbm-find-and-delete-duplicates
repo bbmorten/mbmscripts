@@ -1,0 +1,52 @@
+#!/bin/zsh
+
+# Usage: mbm-find-and-delete-duplicates [--recursive|-r]
+
+if [[ "$1" == "--recursive" || "$1" == "-r" ]]; then
+  echo "Scanning for duplicate files by content (including subfolders)..."
+  find_cmd='find . -type f -print0'
+else
+  echo "Scanning for duplicate files by content (current directory only)..."
+  find_cmd='find . -maxdepth 1 -type f -print0'
+fi
+
+typeset -A hashfiles
+
+# Find files, compute hash, and store file lists (null-delimited)
+eval $find_cmd | while IFS= read -r -d '' file; do
+  hash=$(shasum -a 256 "$file" | awk '{print $1}')
+  hashfiles[$hash]+="$file"$'\0'
+done
+
+found=0
+for hash in ${(k)hashfiles}; do
+  files=()
+  while IFS= read -r -d '' f; do
+    files+=("$f")
+  done <<< "${hashfiles[$hash]}"
+  if (( ${#files} > 1 )); then
+    found=1
+    echo "\nDuplicate files (content hash: $hash):"
+    for f in $files; do
+      echo "  $f"
+    done
+    echo "Keep one and delete the rest? [y/N]"
+    read -q reply
+    echo
+    if [[ $reply == [yY] ]]; then
+      keep="${files[1]}"
+      for f in $files; do
+        if [[ "$f" != "$keep" && -e "$f" ]]; then
+          echo "Deleting $f"
+          rm "$f"
+        fi
+      done
+    else
+      echo "Skipping deletion for this group."
+    fi
+  fi
+done
+
+if (( ! $found )); then
+  echo "No duplicate files found."
+fi

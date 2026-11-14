@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Check that the script was invoked with the correct number of arguments
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <source_directory> <target_directory>"
+    exit 1
+fi
+
+# Set the source and target directories
+source_dir=$1
+target_dir=$2
+
+# Create the target directory if it doesn't exist
+if [ ! -d "$target_dir" ]; then
+    mkdir -p "$target_dir"
+fi
+
+# Copy the directory structure recursively from the source directory to the target directory
+find "$source_dir" -type d -print0 | while read -d $'\0' dir
+do
+    # Create the target directory if it doesn't exist
+    target_subdir="${dir/$source_dir/$target_dir}"
+    if [ ! -d "$target_subdir" ]; then
+        mkdir -p "$target_subdir"
+    fi
+done
+
+echo "Directory structure copied from $source_dir to $target_dir"

@@ -1,0 +1,117 @@
+#!/bin/sh
+# multivpn-routes - the openconnect --script hook used by multivpn for the second (training) tunnel.
+#
+# openconnect runs this as root with the tunnel details in the environment. Unlike the stock
+# vpnc-script it does the minimum, so the tunnel can live next to the Cisco Secure Client one:
+#   - gives the utun interface its address
+#   - adds ONLY the training routes (never a default route)
+#   - changes NO DNS settings (the company tunnel's DNS stays as it is)
+#   - records what it did in the state file, and removes exactly that on disconnect
+#
+# Routes, first match wins:
+#   MULTIVPN_ROUTES   space-separated CIDRs set by multivpn (TRAINING_ROUTES)
+#   CISCO_SPLIT_INC*  the split-include list the server sends
+#   otherwise         the tunnel's own subnet only (the server offered a full tunnel)
+#
+# MULTIVPN_DRYRUN=1 prints the commands instead of running them (no root needed).
+
+STATE="${MULTIVPN_STATE:-/var/run/multivpn-training.state}"
+DRY="${MULTIVPN_DRYRUN:-0}"
+
+run() {
+  if [ "$DRY" = 1 ]; then echo "would run: $*"; else "$@"; fi
+}
+
+# route_cmd add|delete CIDR DEV  (quiet when real: a failed add is reported through SKIPPED)
+route_cmd() {
+  case "$2" in
+    */32) set -- /sbin/route -n "$1" -host "${2%/*}" -interface "$3" ;;
+    *)    set -- /sbin/route -n "$1" -net "$2" -interface "$3" ;;
+  esac
+  if [ "$DRY" = 1 ]; then echo "would run: $*"; else "$@" >/dev/null 2>&1; fi
+}
+
+state_get() {
+  [ -r "$STATE" ] && sed -n "s/^$1=//p" "$STATE" | head -n 1
+}
+
+case "${reason:-}" in
+  connect)
+    [ -n "${TUNDEV:-}" ] || { echo "multivpn-routes: no TUNDEV" >&2; exit 1; }
+    [ -n "${INTERNAL_IP4_ADDRESS:-}" ] || { echo "multivpn-routes: no INTERNAL_IP4_ADDRESS" >&2; exit 1; }
+
+    run /sbin/ifconfig "$TUNDEV" inet "$INTERNAL_IP4_ADDRESS" "$INTERNAL_IP4_ADDRESS" \
+      netmask 255.255.255.255 mtu "${INTERNAL_IP4_MTU:-1300}" up
+
+    wanted=""
+    source=""
+    if [ -n "${MULTIVPN_ROUTES:-}" ]; then
+      wanted="$MULTIVPN_ROUTES"
+      source="configured"
+    elif [ -n "${CISCO_SPLIT_INC:-}" ] && [ "$CISCO_SPLIT_INC" -gt 0 ] 2>/dev/null; then
+      i=0
+      while [ "$i" -lt "$CISCO_SPLIT_INC" ]; do
+        eval "addr=\${CISCO_SPLIT_INC_${i}_ADDR:-}"
+        eval "len=\${CISCO_SPLIT_INC_${i}_MASKLEN:-}"
+        [ -n "$addr" ] && [ -n "$len" ] && wanted="$wanted $addr/$len"
+        i=$((i + 1))
+      done
+      source="server"
+    elif [ -n "${INTERNAL_IP4_NETADDR:-}" ] && [ -n "${INTERNAL_IP4_NETMASKLEN:-}" ]; then
+      wanted="$INTERNAL_IP4_NETADDR/$INTERNAL_IP4_NETMASKLEN"
+      source="tunnel-subnet-only"
+    else
+      source="none"
+    fi
+
+    added=""
+    skipped=""
+    for r in $wanted; do
+      case "$r" in
+        0.0.0.0/*|*/0|default)
+          # A default route here would pull the company and the internet traffic into this tunnel.
+          skipped="$skipped $r"
+          continue ;;
+      esac
+      if route_cmd add "$r" "$TUNDEV"; then
+        added="$added $r"
+      else
+        skipped="$skipped $r"
+      fi
+    done
+
+    if [ "$DRY" = 1 ]; then
+      echo "would write $STATE: TUNDEV=$TUNDEV ADDRESS=$INTERNAL_IP4_ADDRESS ROUTE_SOURCE=$source ROUTES=${added# } SKIPPED=${skipped# }"
+    else
+      umask 022
+      {
+        echo "TUNDEV=$TUNDEV"
+        echo "ADDRESS=$INTERNAL_IP4_ADDRESS"
+        echo "GATEWAY=${VPNGATEWAY:-}"
+        echo "ROUTE_SOURCE=$source"
+        echo "ROUTES=${added# }"
+        echo "SKIPPED=${skipped# }"
+        echo "DNS_OFFERED=${INTERNAL_IP4_DNS:-}"
+        echo "DOMAIN_OFFERED=${CISCO_DEF_DOMAIN:-}"
+        echo "SINCE=$(date +%s)"
+      } > "$STATE"
+    fi
+    ;;
+
+  disconnect)
+    dev="$(state_get TUNDEV)"
+    [ -n "$dev" ] || dev="${TUNDEV:-}"
+    if [ -n "$dev" ]; then
+      for r in $(state_get ROUTES); do
+        route_cmd delete "$r" "$dev"
+      done
+    fi
+    run rm -f "$STATE"
+    ;;
+
+  pre-init|reconnect|attempt-reconnect|"")
+    # Nothing to do: the interface and its routes stay as they are across a reconnect.
+    ;;
+esac
+
+exit 0

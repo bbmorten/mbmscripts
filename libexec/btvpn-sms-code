@@ -1,0 +1,93 @@
+#!/bin/bash
+# btvpn-sms-code - print the verification code from the newest SMS that reached this Mac
+# (Messages, via iPhone Text Message Forwarding) after a given time.
+#
+# Usage: btvpn-sms-code [-v] SINCE_UNIX_EPOCH
+#   -v   also print the sender and the decoded message text (to stderr)
+# Exit:  0 code printed, 1 no matching message yet, 3 Messages database not readable
+#        (give the terminal app - Terminal, iTerm or Visual Studio Code - Full Disk Access).
+#
+# Environment:
+#   BTVPN_SMS_FROM   only messages whose sender contains this text (case-insensitive)
+#   BTVPN_SMS_REGEX  how the code is found in the message text:
+#                      (empty)  default: "One-Time Password is: 123456", then a number next to
+#                               a code word (code, kod, sifre, parola, otp, passcode, password, pin)
+#                      any      the default rules, then a lone 6-digit number. Looser: another
+#                               SMS arriving at the same moment can match.
+#                      other    an extended regex whose match holds the code (its digits are taken)
+#   BTVPN_CHAT_DB    database path (default ~/Library/Messages/chat.db; used for tests)
+#
+# Bash 3.2 compatible. Read-only: opens the database with -readonly.
+
+set -u
+
+verbose=0
+if [ "${1:-}" = "-v" ]; then verbose=1; shift; fi
+since="${1:-}"
+case "$since" in ''|*[!0-9]*) echo "usage: btvpn-sms-code [-v] SINCE_UNIX_EPOCH" >&2; exit 2 ;; esac
+
+db="${BTVPN_CHAT_DB:-$HOME/Library/Messages/chat.db}"
+from="${BTVPN_SMS_FROM:-}"
+
+# Messages stores dates as nanoseconds since 2001-01-01.
+apple_since=$(( (since - 978307200) * 1000000000 ))
+
+rows="$(sqlite3 -readonly -separator '|' "$db" \
+  "select coalesce(h.id,''), hex(coalesce(m.text,'')), hex(coalesce(m.attributedBody,x''))
+     from message m left join handle h on h.ROWID = m.handle_id
+    where m.is_from_me = 0 and m.date > $apple_since
+    order by m.date desc limit 10;" 2>/dev/null)" || exit 3
+
+[ -n "$rows" ] || exit 1
+
+# Hex blob -> bytes; keep printable ASCII and turn the rest into spaces (attributedBody is
+# a binary archive, but the message text sits in it as plain bytes).
+decode() { printf '%s' "$1" | xxd -r -p | LC_ALL=C tr -c '[:print:]' ' '; }
+
+# The usual wording of a VPN one-time password SMS, e.g.
+#   "Dear user@example.com, Your One-Time Password is: 123456 B043"
+# (B043 is a reference suffix, not part of the code).
+OTP_REGEX='One-Time Password is:? *[0-9]{4,8}'
+CODE_WORDS='(code|kod|sifre|parola|otp|passcode|password|pin)'
+
+extract() {
+  local t="$1" m="" re="${BTVPN_SMS_REGEX:-}"
+  if [ -n "$re" ] && [ "$re" != "any" ]; then
+    m="$(printf '%s' "$t" | grep -oiE -- "$re" | head -n 1)"
+    [ -n "$m" ] && printf '%s' "$m" | tr -cd '0-9'
+    return
+  fi
+  m="$(printf '%s' "$t" | grep -oiE -- "$OTP_REGEX" | head -n 1 | tr -cd '0-9')"
+  # A number near a code word (English or Turkish), either order.
+  [ -n "$m" ] || m="$(printf '%s' "$t" | grep -oiE "${CODE_WORDS}[^0-9]{0,40}[0-9]{4,8}" \
+        | head -n 1 | grep -oE '[0-9]{4,8}$')"
+  [ -n "$m" ] || m="$(printf '%s' "$t" | grep -oiE "[0-9]{4,8}[^0-9]{0,40}${CODE_WORDS}" \
+        | head -n 1 | grep -oE '^[0-9]{4,8}')"
+  if [ -z "$m" ] && [ "$re" = "any" ]; then
+    m="$(printf ' %s ' "$t" | grep -oE '[^0-9][0-9]{6}[^0-9]' | head -n 1 | tr -cd '0-9')"
+  fi
+  printf '%s' "$m"
+}
+
+while IFS='|' read -r sender text_hex body_hex; do
+  if [ -n "$from" ]; then
+    printf '%s' "$sender" | grep -qiF -- "$from" || continue
+  fi
+  text="$(decode "$text_hex")"
+  [ -n "$(printf '%s' "$text" | tr -d ' ')" ] || text="$(decode "$body_hex")"
+  code="$(extract "$text")"
+  if [ "$verbose" = 1 ]; then
+    echo "from: $sender" >&2
+    # Display only: drop the archive wrapper around the message text.
+    echo "text: $(printf '%s' "$text" | tr -s ' ' | sed -E 's/^.*NSString \+.//; s/ iI( .*)?$//' | cut -c1-200)" >&2
+    echo "code: ${code:-<none>}" >&2
+  fi
+  if [ -n "$code" ]; then
+    echo "$code"
+    exit 0
+  fi
+done <<EOF_BTVPN_ROWS
+$rows
+EOF_BTVPN_ROWS
+
+exit 1

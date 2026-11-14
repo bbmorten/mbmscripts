@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# Shut down the ens160 interface
+echo "Shutting down ens160 interface..."
+sudo ifconfig ens160 down
+
+# Wait for 60 seconds
+echo "Waiting for 60 seconds..."
+sleep 60
+
+# Open up the ens160 interface
+echo "Opening up ens160 interface..."
+sudo ifconfig ens160 up
+
+echo "Done."
+

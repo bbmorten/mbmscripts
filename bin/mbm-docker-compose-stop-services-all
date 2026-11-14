@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# Get the list of running Docker Compose projects
+projects=$(docker compose ls | awk 'NR>1 {print $1}')
+
+# Loop through each project and run `docker compose down`
+for project in $projects; do
+  echo "Stopping project $project..."
+  docker compose -p $project down
+done

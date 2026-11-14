@@ -1,0 +1,30 @@
+#!/bin/zsh
+
+# Check if the user provided a directory argument
+if [[ -z "$1" ]]; then
+  echo "Usage: $0 <directory>"
+  exit 1
+fi
+
+DIRECTORY="$1"
+LOGFILE="Filesover100M.txt"
+
+# Check if the provided argument is a valid directory
+if [[ ! -d "$DIRECTORY" ]]; then
+  echo "Error: '$DIRECTORY' is not a valid directory."
+  exit 1
+fi
+
+# Find files larger than 100MB and log them with full path and size
+echo "Searching for files larger than 100MB in '$DIRECTORY'..."
+find "$DIRECTORY" -type f -size +100M -exec du -h {} + | sort -hr > "$LOGFILE"
+
+# Display results
+if [[ -s "$LOGFILE" ]]; then
+  echo "Found files over 100MB:"
+  cat "$LOGFILE"
+else
+  echo "No files over 100MB found."
+fi
+
+echo "Results saved to '$LOGFILE'."
