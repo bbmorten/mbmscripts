@@ -1,8 +1,8 @@
 #!/bin/bash
-# Tests for mbm-srd.   Run:  tests/run.sh srd    or:  bash tests/commands/srd.sh
+# Tests for mbm-compose-up.   Run:  tests/run.sh compose-up    or:  bash tests/commands/compose-up.sh
 . "$(dirname "$0")/../lib.sh"
-CMD="$BIN/mbm-srd"
-echo "mbm-srd"
+CMD="$BIN/mbm-compose-up"
+echo "mbm-compose-up"
 
 # project DIR [FILE] - a folder with a compose file
 project() { mkdir -p "$1"; echo "services: {}" > "$1/${2:-compose.yaml}"; }
@@ -34,11 +34,11 @@ project "$P"
 run "$CMD" "$P"
 check "DIR with a space: compose up there" "$UP|$P" "$(calls)|$(sort -u "$TMP/cwd.log")"
 : > "$TMP/cwd.log"
-run env MBM_SRD_DIR="$P" "$CMD"
-check "MBM_SRD_DIR is the folder when no DIR is given" "$P" "$(sort -u "$TMP/cwd.log")"
+run env MBM_COMPOSE_UP_DIR="$P" "$CMD"
+check "MBM_COMPOSE_UP_DIR is the folder when no DIR is given" "$P" "$(sort -u "$TMP/cwd.log")"
 : > "$TMP/cwd.log"
-run env MBM_SRD_DIR="$P" "$CMD" "$DEF"
-check "DIR wins over MBM_SRD_DIR" "$DEF" "$(sort -u "$TMP/cwd.log")"
+run env MBM_COMPOSE_UP_DIR="$P" "$CMD" "$DEF"
+check "DIR wins over MBM_COMPOSE_UP_DIR" "$DEF" "$(sort -u "$TMP/cwd.log")"
 for f in compose.yml docker-compose.yml docker-compose.yaml; do
   project "$TMP/p-$f" "$f"
   run "$CMD" "$TMP/p-$f"
@@ -111,7 +111,7 @@ run "$CMD" "$TMP/empty"
 check "a folder without a compose file: exit 1" "1" "$RC"
 has "a folder without a compose file: says which names count" "docker-compose.yml" "$ERR"
 run env HOME="$TMP/other-home" "$CMD"
-has "the default folder is missing: names the setting" "MBM_SRD_DIR" "$ERR"
+has "the default folder is missing: names the setting" "MBM_COMPOSE_UP_DIR" "$ERR"
 run "$CMD" "$DEF" "$P"
 check "two folders: exit 2" "2" "$RC"
 run "$CMD" down
@@ -140,8 +140,8 @@ check "docker is not installed: exit 1" "1" "$RC"
 has "docker is not installed: says how to get it" "docs.docker.com" "$ERR"
 
 mkdir -p "$TMP/inst"
-ln -s "$CMD" "$TMP/inst/zz-srd"
-run "$TMP/inst/zz-srd" "$TMP/empty"
-has "called as zz-srd, the error carries that name" "zz-srd: no compose file" "$ERR"
+ln -s "$CMD" "$TMP/inst/zz-compose-up"
+run "$TMP/inst/zz-compose-up" "$TMP/empty"
+has "called as zz-compose-up, the error carries that name" "zz-compose-up: no compose file" "$ERR"
 
 finish

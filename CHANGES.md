@@ -1,5 +1,27 @@
 # Changes
 
+## 2026-11-15: fewer commands, clearer names
+
+| Before | Now |
+| --- | --- |
+| `mbm-sync-git-msp` and `mbm-sync-git-msp-v2` | one command, `mbm-sync-git-msp`: the progress line, the summary and `--history` of the former -v2, and `-v` for the list of files the plain one printed |
+| `mbm-nextra-setup-w-podman` | `mbm-nextra-setup --podman` |
+| `mbm-run-docker-web3` | `mbm-run-docker-web -d ~/git-repos/docker-v3` (add `-t docker` to copy to the old folder on the host) |
+| `mbm-sdd` | `mbm-mkdocs-serve` |
+| `mbm-srd` | `mbm-compose-up` |
+| `mbm-interface-test` | `mbm-interface-bounce` |
+
+Settings that changed with them:
+
+- `MBM_SYNC_V2_REMOTE_HOST` is no longer read. `mbm-sync-git-msp` takes its host from
+  `--host`, else `MBM_SYNC_REMOTE_HOST`, else `MBM_REMOTE_HOST`.
+- `MBM_SDD_DIR` is now `MBM_MKDOCS_SERVE_DIR`, and `MBM_SRD_DIR` is now `MBM_COMPOSE_UP_DIR`.
+- `MBM_DOCKER_WEB3_DIR` and `MBM_DOCKER_WEB3_REMOTE_DIR` are gone with the command; use
+  `-d` and `-t` of `mbm-run-docker-web`.
+
+Run `./install.sh --yes` once after updating, so the installed commands get the new names.
+The sections below still use the names the commands had at the time.
+
 ## 2026-11-15: every command reworked
 
 Every command except `mbm-btvpn` and `mbm-multivpn` was tested as it was, fixed, given a standard `--help`, and given its own test file in `tests/commands/`. Commands that delete, stop or overwrite something now list what they will do, ask first, and offer `-n` (dry run) and `-y` (no question). **A script or a scheduled job that runs one of those must now add `--yes`**: without a terminal they refuse instead of guessing.

@@ -1,8 +1,8 @@
 #!/bin/bash
-# Tests for mbm-sdd.   Run:  tests/run.sh sdd    or:  bash tests/commands/sdd.sh
+# Tests for mbm-mkdocs-serve.   Run:  tests/run.sh mkdocs-serve    or:  bash tests/commands/mkdocs-serve.sh
 . "$(dirname "$0")/../lib.sh"
-CMD="$BIN/mbm-sdd"
-echo "mbm-sdd"
+CMD="$BIN/mbm-mkdocs-serve"
+echo "mbm-mkdocs-serve"
 
 # project DIR [FILE] - a mkdocs project folder
 project() { mkdir -p "$1"; echo "site_name: test" > "$1/${2:-mkdocs.yml}"; }
@@ -28,10 +28,10 @@ cd "$TMP" || exit 1
 run "$CMD" "my docs"
 has "a relative DIR works" "path-mkdocs in $TMP/my docs" "$OUT"
 cd "$HOME" || exit 1
-run env MBM_SDD_DIR="$TMP/my docs" "$CMD"
-has "MBM_SDD_DIR is the folder when no DIR is given" "path-mkdocs in $TMP/my docs" "$OUT"
-run env MBM_SDD_DIR="$TMP/my docs" "$CMD" "$DEF"
-has "DIR wins over MBM_SDD_DIR" "path-mkdocs in $DEF" "$OUT"
+run env MBM_MKDOCS_SERVE_DIR="$TMP/my docs" "$CMD"
+has "MBM_MKDOCS_SERVE_DIR is the folder when no DIR is given" "path-mkdocs in $TMP/my docs" "$OUT"
+run env MBM_MKDOCS_SERVE_DIR="$TMP/my docs" "$CMD" "$DEF"
+has "DIR wins over MBM_MKDOCS_SERVE_DIR" "path-mkdocs in $DEF" "$OUT"
 project "$TMP/yaml" mkdocs.yaml
 run "$CMD" "$TMP/yaml"
 check "mkdocs.yaml counts as a project too" "0" "$RC"
@@ -84,7 +84,7 @@ check "a folder without mkdocs.yml: exit 1" "1" "$RC"
 has "a folder without mkdocs.yml: says so" "no mkdocs.yml in $TMP/empty" "$ERR"
 run env HOME="$TMP/other-home" "$CMD"
 check "the default folder is missing: exit 1" "1" "$RC"
-has "the default folder is missing: names the setting" "MBM_SDD_DIR" "$ERR"
+has "the default folder is missing: names the setting" "MBM_MKDOCS_SERVE_DIR" "$ERR"
 run "$CMD" "$DEF" "$TMP/my docs"
 check "two folders: exit 2" "2" "$RC"
 has "two folders: points to --help" "--help" "$ERR"
@@ -98,8 +98,8 @@ check "mkdocs is not installed: exit 1" "1" "$RC"
 has "mkdocs is not installed: says how to get it" "pip install mkdocs" "$ERR"
 
 mkdir -p "$TMP/inst"
-ln -s "$CMD" "$TMP/inst/zz-sdd"
-run "$TMP/inst/zz-sdd" "$TMP/empty"
-has "called as zz-sdd, the error carries that name" "zz-sdd: no mkdocs.yml" "$ERR"
+ln -s "$CMD" "$TMP/inst/zz-mkdocs-serve"
+run "$TMP/inst/zz-mkdocs-serve" "$TMP/empty"
+has "called as zz-mkdocs-serve, the error carries that name" "zz-mkdocs-serve: no mkdocs.yml" "$ERR"
 
 finish

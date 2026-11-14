@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# mbm-interface-test - take a network interface down, wait, and bring it up again (a link outage on purpose)
+# mbm-interface-bounce - take a network interface down, wait, and bring it up again (a link outage on purpose)
 #
 # Usage:
-#   mbm-interface-test [-t SECONDS] [-n] [-y] IFACE
+#   mbm-interface-bounce [-t SECONDS] [-n] [-y] IFACE
 #
 # Arguments:
 #   IFACE   the interface, for example eth0 or ens160.
@@ -27,9 +27,9 @@
 # at that moment. A console, or a session over another interface, is still the better place.
 #
 # Examples:
-#   mbm-interface-test eth0
-#   mbm-interface-test -t 10 -y ens160
-#   mbm-interface-test -n en0
+#   mbm-interface-bounce eth0
+#   mbm-interface-bounce -t 10 -y ens160
+#   mbm-interface-bounce -n en0
 #
 # Exit status: 0 the interface is up again, 1 it was not done or could not be brought up
 # (the message says which), 2 called wrongly; 130 after Ctrl-C (the interface is up again).
@@ -39,7 +39,7 @@
 set -u
 ME="${0##*/}"
 SELF="$0"
-usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%interface-test}/g"; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%interface-bounce}/g"; }
 die() { echo "$ME: $*" >&2; exit 1; }
 bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 confirm() {   # confirm "Question?"   true on y / yes

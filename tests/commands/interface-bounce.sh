@@ -1,8 +1,8 @@
 #!/bin/bash
-# Tests for mbm-interface-test.   Run:  tests/run.sh interface-test    or:  bash tests/commands/interface-test.sh
+# Tests for mbm-interface-bounce.   Run:  tests/run.sh interface-bounce    or:  bash tests/commands/interface-bounce.sh
 . "$(dirname "$0")/../lib.sh"
-CMD="$BIN/mbm-interface-test"
-echo "mbm-interface-test"
+CMD="$BIN/mbm-interface-bounce"
+echo "mbm-interface-bounce"
 
 # Everything that touches an interface is a fake here: ip, ifconfig, sudo, id, sleep.
 # FAKE_ROOT=1 makes "id -u" answer 0; the fake sudo sets it and runs the command.
@@ -152,12 +152,12 @@ check "as root: the same job" "ip link set dev eth0 down;sleep 2;ip link set dev
 check "as root: no sudo" "" "$(calls sudo)"
 reset_calls
 mkdir -p "$TMP/zz"
-ln -s "$CMD" "$TMP/zz/zz-interface-test"
-run "$TMP/zz/zz-interface-test" -y -t 2 eth0
-check "under another prefix sudo runs the command by the name it was called" "sudo -u root -- $TMP/zz/zz-interface-test --yes --time 2 -- eth0" "$(calls sudo)"
+ln -s "$CMD" "$TMP/zz/zz-interface-bounce"
+run "$TMP/zz/zz-interface-bounce" -y -t 2 eth0
+check "under another prefix sudo runs the command by the name it was called" "sudo -u root -- $TMP/zz/zz-interface-bounce --yes --time 2 -- eth0" "$(calls sudo)"
 reset_calls
-OUT="$(cd "$BIN" && /bin/bash mbm-interface-test -y -t 2 eth0 2>&1)"
-check "started without a folder in its name, sudo still gets a path" "sudo -u root -- ./mbm-interface-test --yes --time 2 -- eth0" "$(calls sudo)"
+OUT="$(cd "$BIN" && /bin/bash mbm-interface-bounce -y -t 2 eth0 2>&1)"
+check "started without a folder in its name, sudo still gets a path" "sudo -u root -- ./mbm-interface-bounce --yes --time 2 -- eth0" "$(calls sudo)"
 
 echo " when a step fails"
 reset_calls

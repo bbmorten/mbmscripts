@@ -44,10 +44,6 @@ usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' 
 die() { echo "$ME: $*" >&2; exit 1; }
 bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-# mbm-nextra-setup-w-podman runs this file and passes the name it was called by, so that
-# messages name the command the person typed.
-ME="${NEXTRA_SETUP_ME:-$ME}"
-
 NODE_IMAGE=node:24-slim
 PORT=3000
 PODMAN=0

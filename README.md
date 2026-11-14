@@ -76,7 +76,7 @@ terminal they refuse instead of guessing, so **a script or scheduled job must pa
 | `mbm-btvpn` | Connect to your company's Cisco VPN with one command (Keychain password, SMS code from Messages). |
 | `mbm-multivpn` | Keep a second VPN connected next to the company one (openconnect + ocproxy). |
 | `mbm-print-route` | Show the routing table in short form, or the route used to reach one destination. |
-| `mbm-interface-test` | Take a network interface down for some seconds, then bring it up again (asks first). |
+| `mbm-interface-bounce` | Take a network interface down for some seconds, then bring it up again (asks first). |
 | `mbm-sslkeylog-capture` | Record a browser session as a packet capture plus the TLS keys that decrypt it. |
 | `mbm-eth-conv` | Count the frames between each pair of Ethernet addresses in a capture file. |
 | `mbm-extract-time-info-w-tshark` | Show first and last packet time, duration and packet count of capture files. |
@@ -98,8 +98,7 @@ terminal they refuse instead of guessing, so **a script or scheduled job must pa
 
 | Command | What it does |
 | --- | --- |
-| `mbm-sync-git-msp` | Mirror a local folder to a folder on a remote host with rsync over ssh. |
-| `mbm-sync-git-msp-v2` | Mirror a local folder to a remote host with rsync, with progress and a history of runs. |
+| `mbm-sync-git-msp` | Mirror a local folder to a remote host with rsync, with progress and a history of runs. |
 | `mbm-my-sync` | Copy a folder to another place with rsync, now and again after every change. |
 | `mbm-my-sync-fswatch` | Pull a folder from another machine with rsync, now and after every change there. |
 | `mbm-copy-zsh-settings` | Copy your zsh configuration to another machine over ssh, with a backup there. |
@@ -112,11 +111,9 @@ terminal they refuse instead of guessing, so **a script or scheduled job must pa
 | `mbm-change-filename` | Rename DDMMYYYY.md files under a folder to YYYYMMDD.md so that they sort by date. |
 | `mbm-replace-heading` | Rewrite a first-line heading # DDMMYYYY as # YYYYMMDD in the Markdown files of a folder. |
 | `mbm-create-outline-markdown` | Turn the list items of a Markdown outline into links to stub pages it creates. |
-| `mbm-nextra-setup` | Create a Nextra 4 documentation site project in a new folder. |
-| `mbm-nextra-setup-w-podman` | Create a Nextra 4 documentation site project with a Podman runner script. |
-| `mbm-sdd` | Serve a mkdocs documentation project locally while you edit it. |
+| `mbm-nextra-setup` | Create a Nextra 4 documentation site project in a new folder, for Docker or (--podman) Podman. |
+| `mbm-mkdocs-serve` | Serve a mkdocs documentation project locally while you edit it. |
 | `mbm-run-docker-web` | Build a mkdocs site, copy it to a remote host and serve it there with nginx in Docker. |
-| `mbm-run-docker-web3` | Publish a second mkdocs site (docker-v3) the same way, with its own folders. |
 
 ### Containers and models
 
@@ -125,7 +122,7 @@ terminal they refuse instead of guessing, so **a script or scheduled job must pa
 | `mbm-docker-cmdline` | Print the command line a container or image runs, quoted for pasting into a shell. |
 | `mbm-docker-compose-start-services` | Start Docker Compose projects by folder name under a base folder, or list them. |
 | `mbm-docker-compose-stop-services-all` | Stop or take down every running Docker Compose project, after listing and asking. |
-| `mbm-srd` | Start the Docker Compose project in a folder in the background, or stop it. |
+| `mbm-compose-up` | Start the Docker Compose project in a folder in the background, or stop it. |
 | `mbm-lima-podman-w-target` | Start the Lima podman machine kept in a disk image on an external volume (macOS). |
 | `mbm-delete-old-models` | Delete the ollama models pulled or changed at least N days ago, after listing them. |
 
@@ -145,20 +142,18 @@ those in `~/.<name>/local.env`. The installer never touches that file, and both 
 
 ```sh
 # ~/.mbmscripts/local.env
-export MBM_REMOTE_HOST="192.0.2.10"           # sync-git-msp(-v2), copy-zsh-settings (or --host)
+export MBM_REMOTE_HOST="192.0.2.10"           # sync-git-msp, copy-zsh-settings (or --host)
 export MBM_REMOTE_USER="me"                   # default: your local user name
-export MBM_SYNC_SOURCE_DIR="$HOME/git-msp/"   # sync-git-msp(-v2) --source; default ~/git-msp/
-export MBM_SYNC_REMOTE_DIR="git-msp/"         # sync-git-msp(-v2) --dest; default git-msp/
-export MBM_SYNC_V2_REMOTE_HOST="192.0.2.11"   # sync-git-msp-v2 only; default: MBM_REMOTE_HOST
+export MBM_SYNC_SOURCE_DIR="$HOME/git-msp/"   # sync-git-msp --source; default ~/git-msp/
+export MBM_SYNC_REMOTE_DIR="git-msp/"         # sync-git-msp --dest; default git-msp/
+export MBM_SYNC_REMOTE_HOST="192.0.2.11"      # sync-git-msp only; default: MBM_REMOTE_HOST
 export MBM_CONTAINER_ENGINE="podman"          # the docker-* commands; default docker
 export MBM_COMPOSE_BASE_DIR="$HOME/projects"  # docker-compose-start-services; default ~/git-repos
-export MBM_SRD_DIR="$HOME/git-repos/mydocs"   # srd; this is the default
-export MBM_SDD_DIR="$HOME/git-repos/docker"   # sdd; this is the default
+export MBM_COMPOSE_UP_DIR="$HOME/git-repos/mydocs"    # compose-up; this is the default
+export MBM_MKDOCS_SERVE_DIR="$HOME/git-repos/docker"  # mkdocs-serve; this is the default
 export MBM_DOCKER_WEB_DIR="$HOME/git-repos/docker"      # run-docker-web; this is the default
-export MBM_DOCKER_WEB3_DIR="$HOME/git-repos/docker-v3"  # run-docker-web3; this is the default
-export MBM_DOCKER_WEB_USER="vm"               # run-docker-web(3), the user on the host; default vm
+export MBM_DOCKER_WEB_USER="vm"               # run-docker-web, the user on the host; default vm
 export MBM_DOCKER_WEB_REMOTE_DIR="site"       # run-docker-web; default: the project folder's name
-export MBM_DOCKER_WEB3_REMOTE_DIR="site3"     # run-docker-web3; default: the project folder's name
 export MBM_LIMA_VOLUME="MyDisk"               # lima-podman-w-target; default External
 export MBM_LIMA_TEMPLATE="template://podman"  # lima-podman-w-target; this is the default
 export MBM_LOGGER_DIR="$HOME/TerminalLogs"    # logger; default ~/Documents/Temp/TerminalLogs

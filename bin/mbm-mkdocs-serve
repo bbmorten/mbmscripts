@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# mbm-sdd - serve a mkdocs documentation project on this machine while you edit it
+# mbm-mkdocs-serve - serve a mkdocs documentation project on this machine while you edit it
 #
 # Usage:
-#   mbm-sdd [DIR] [-- MKDOCS_ARGUMENTS...]
+#   mbm-mkdocs-serve [DIR] [-- MKDOCS_ARGUMENTS...]
 #
 # Arguments:
 #   DIR                the project folder, the one that holds mkdocs.yml
-#                      (default: $MBM_SDD_DIR, else ~/git-repos/docker)
+#                      (default: $MBM_MKDOCS_SERVE_DIR, else ~/git-repos/docker)
 #   MKDOCS_ARGUMENTS   everything after -- is handed to "mkdocs serve" unchanged
 #
 # Options:
@@ -18,18 +18,18 @@
 # docs": it began as the shortcut for one project, which is still the default folder.
 #
 # Examples:
-#   mbm-sdd
-#   mbm-sdd ~/projects/handbook
-#   mbm-sdd ~/projects/handbook -- -a 127.0.0.1:8001
-#   mbm-sdd -- --strict
+#   mbm-mkdocs-serve
+#   mbm-mkdocs-serve ~/projects/handbook
+#   mbm-mkdocs-serve ~/projects/handbook -- -a 127.0.0.1:8001
+#   mbm-mkdocs-serve -- --strict
 #
 # Needs: mkdocs (pip install mkdocs), on the PATH or in DIR/.venv. macOS and Linux.
-# Settings: MBM_SDD_DIR   the project folder when no DIR is given (default: ~/git-repos/docker)
+# Settings: MBM_MKDOCS_SERVE_DIR   the project folder when no DIR is given (default: ~/git-repos/docker)
 
 set -u
 ME="${0##*/}"
 SELF="$0"
-usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%sdd}/g"; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%mkdocs-serve}/g"; }
 die() { echo "$ME: $*" >&2; exit 1; }
 bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
@@ -47,8 +47,8 @@ while [ $# -gt 0 ]; do
 done
 # What is left in "$@" goes to mkdocs.
 
-[ "$given" = 1 ] || DIR="${MBM_SDD_DIR:-$HOME/git-repos/docker}"
-[ -d "$DIR" ] || die "no such folder: $DIR (name the project folder, or set MBM_SDD_DIR)"
+[ "$given" = 1 ] || DIR="${MBM_MKDOCS_SERVE_DIR:-$HOME/git-repos/docker}"
+[ -d "$DIR" ] || die "no such folder: $DIR (name the project folder, or set MBM_MKDOCS_SERVE_DIR)"
 [ -f "$DIR/mkdocs.yml" ] || [ -f "$DIR/mkdocs.yaml" ] || die "no mkdocs.yml in $DIR - that is not a mkdocs project"
 cd -- "$DIR" || die "cannot enter $DIR"
 

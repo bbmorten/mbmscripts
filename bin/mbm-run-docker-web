@@ -33,6 +33,7 @@
 # Examples:
 #   mbm-run-docker-web lab-vm
 #   mbm-run-docker-web lab-vm 8080
+#   mbm-run-docker-web -d ~/git-repos/docker-v3 lab-vm 5501      a second site, next to the first
 #   mbm-run-docker-web -n -d ~/projects/handbook -u deploy -t sites/handbook -p 8080 docs.example.com
 #
 # Needs: mkdocs (pip install mkdocs), rsync and ssh on this machine. On HOST: an ssh login for

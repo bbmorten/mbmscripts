@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# mbm-srd - start the Docker Compose project in a folder in the background, or stop it
+# mbm-compose-up - start the Docker Compose project in a folder in the background, or stop it
 #
 # Usage:
-#   mbm-srd [-n] [DIR]
-#   mbm-srd -d [-n] [-y] [DIR]
+#   mbm-compose-up [-n] [DIR]
+#   mbm-compose-up -d [-n] [-y] [DIR]
 #
 # Arguments:
 #   DIR             the folder that holds the compose file
-#                   (default: $MBM_SRD_DIR, else ~/git-repos/mydocs)
+#                   (default: $MBM_COMPOSE_UP_DIR, else ~/git-repos/mydocs)
 #
 # Options:
 #   -d, --down      stop the project and remove its containers ("docker compose down")
@@ -21,20 +21,20 @@
 # as the shortcut for one documentation stack, which is still the default folder.
 #
 # Examples:
-#   mbm-srd
-#   mbm-srd ~/projects/wiki
-#   mbm-srd -n ~/projects/wiki
-#   mbm-srd --down --yes ~/projects/wiki
+#   mbm-compose-up
+#   mbm-compose-up ~/projects/wiki
+#   mbm-compose-up -n ~/projects/wiki
+#   mbm-compose-up --down --yes ~/projects/wiki
 #
 # Needs: docker with the compose plugin (Docker Desktop, or https://docs.docker.com/engine/install/).
 #        macOS and Linux.
-# Settings: MBM_SRD_DIR   the folder when no DIR is given (default: ~/git-repos/mydocs)
+# Settings: MBM_COMPOSE_UP_DIR   the folder when no DIR is given (default: ~/git-repos/mydocs)
 # Exit status: 0 done; 1 it could not be done, or you answered no; 2 wrong usage.
 
 set -u
 ME="${0##*/}"
 SELF="$0"
-usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%srd}/g"; }
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%compose-up}/g"; }
 die() { echo "$ME: $*" >&2; exit 1; }
 bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
@@ -63,8 +63,8 @@ while [ $# -gt 0 ]; do
   DIR="$1"; given=1; shift
 done
 
-[ "$given" = 1 ] || DIR="${MBM_SRD_DIR:-$HOME/git-repos/mydocs}"
-[ -d "$DIR" ] || die "no such folder: $DIR (name the project folder, or set MBM_SRD_DIR)"
+[ "$given" = 1 ] || DIR="${MBM_COMPOSE_UP_DIR:-$HOME/git-repos/mydocs}"
+[ -d "$DIR" ] || die "no such folder: $DIR (name the project folder, or set MBM_COMPOSE_UP_DIR)"
 cd -- "$DIR" || die "cannot enter $DIR"
 found=""
 for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
