@@ -1,8 +1,125 @@
-#!/bin/bash
-CONTAINER_ID=$1
-ENTRYPOINT=$(docker inspect --format '{{json .Config.Entrypoint}}' $CONTAINER_ID | jq -r '.[]')
-CMD=$(docker inspect --format '{{json .Config.Cmd}}' $CONTAINER_ID | jq -r '.[]')
+#!/usr/bin/env bash
+# mbm-docker-cmdline - print the command line a container or an image runs (entrypoint plus command)
+#
+# Usage:
+#   mbm-docker-cmdline [-e ENGINE] CONTAINER...
+#
+# Arguments:
+#   CONTAINER   the name or ID of a container; the name of an image works too
+#
+# Options:
+#   -e ENGINE, --engine ENGINE   the program to ask, for example podman (default: docker)
+#   -h, --help                   show this help
+#
+# Output: one line per container. Each argument is quoted where the shell needs it, so the
+# line can be pasted into a shell. With more than one container each line starts with
+# "CONTAINER: ".
+#
+# Examples:
+#   mbm-docker-cmdline web
+#   mbm-docker-cmdline nginx:alpine
+#   mbm-docker-cmdline $(docker ps -q)
+#   mbm-docker-cmdline -e podman web
+#
+# Exit status: 0 done; 1 a container was not found or runs nothing; 2 called wrongly.
+# Needs: docker (https://docs.docker.com/get-docker/) or another engine with "inspect --format".
+# Settings: MBM_CONTAINER_ENGINE   the engine when -e is not given (default: docker)
 
-FULL_COMMAND="$ENTRYPOINT $CMD"
-echo $FULL_COMMAND
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%docker-cmdline}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
+ENGINE="${MBM_CONTAINER_ENGINE:-docker}"
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -e|--engine) [ $# -ge 2 ] || bad_usage "$1 needs a value"; ENGINE="$2"; shift ;;
+    --engine=*) ENGINE="${1#*=}" ;;
+    --) shift; ARGS+=("$@"); break ;;
+    -*) bad_usage "unknown option $1" ;;
+    *) ARGS+=("$1") ;;
+  esac
+  shift
+done
+[ "${#ARGS[@]}" -gt 0 ] || bad_usage "no container given"
+[ -n "$ENGINE" ] || bad_usage "the engine name is empty"
+command -v "$ENGINE" >/dev/null 2>&1 ||
+  die "$ENGINE is not installed (Docker: https://docs.docker.com/get-docker/; another engine: -e NAME)"
+
+# Reads JSON values on one line (null, "text" or ["a","b"]) and prints every text in them,
+# in order, on one line, quoted for the shell.
+quote_args() {
+  LC_ALL=C awk -v q="'" '
+    function hexval(h,   i, v) {
+      v = 0
+      for (i = 1; i <= length(h); i++) v = v * 16 + index("0123456789abcdef", tolower(substr(h, i, 1))) - 1
+      return v
+    }
+    function shq(s,   i, c, r, ansi) {
+      if (s ~ /^[A-Za-z0-9_@%+=:,.\/-]+$/) return s
+      # A line break or a tab would split the output line: those go in the $-quoted form (\n, \t).
+      ansi = (index(s, "\n") || index(s, "\t") || index(s, "\r"))
+      r = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (ansi) {
+          if (c == "\\") c = "\\\\"
+          else if (c == q) c = "\\" q
+          else if (c == "\n") c = "\\n"
+          else if (c == "\t") c = "\\t"
+          else if (c == "\r") c = "\\r"
+        } else if (c == q) c = q "\\" q q
+        r = r c
+      }
+      return (ansi ? "$" : "") q r q
+    }
+    {
+      n = length($0); i = 1; out = ""; count = 0
+      while (i <= n) {
+        if (substr($0, i, 1) != "\"") { i++; continue }
+        s = ""
+        for (i++; i <= n; i++) {
+          c = substr($0, i, 1)
+          if (c == "\"") break
+          if (c == "\\") {
+            c = substr($0, ++i, 1)
+            if (c == "n") c = "\n"
+            else if (c == "t") c = "\t"
+            else if (c == "r") c = "\r"
+            else if (c == "b") c = "\b"
+            else if (c == "f") c = "\f"
+            else if (c == "u") {
+              code = hexval(substr($0, i + 1, 4))
+              c = (code > 0 && code < 128) ? sprintf("%c", code) : "\\u" substr($0, i + 1, 4)
+              i += 4
+            }
+          }
+          s = s c
+        }
+        i++
+        out = out (count++ ? " " : "") shq(s)
+      }
+      print out
+    }'
+}
+
+FORMAT='{{json .Config.Entrypoint}} {{json .Config.Cmd}}'
+failed=0
+for c in "${ARGS[@]}"; do
+  # The engine prints its own message when there is no such container.
+  json="$("$ENGINE" inspect --format "$FORMAT" "$c")" || { failed=1; continue; }
+  line="$(printf '%s\n' "$json" | quote_args)"
+  if [ -z "$line" ]; then
+    echo "$ME: $c has neither an entrypoint nor a command" >&2
+    failed=1
+  elif [ "${#ARGS[@]}" -gt 1 ]; then
+    printf '%s: %s\n' "$c" "$line"
+  else
+    printf '%s\n' "$line"
+  fi
+done
+exit "$failed"

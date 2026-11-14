@@ -1,218 +1,268 @@
 #!/usr/bin/env bash
+# mbm-sslkeylog-capture - record a browser session as a packet capture together with the TLS keys that decrypt it
 #
-# mbm-sslkeylog-capture
-#
-# Launch a browser with SSLKEYLOGFILE pointing at a timestamped log, and in
-# parallel capture packets with tshark to a timestamped .pcapng. The two run
-# together until you stop the session (press Enter or Ctrl-C), at which point
-# the browser and the capture are both shut down cleanly.
+# Starts a separate Chrome or Firefox with SSLKEYLOGFILE set and, at the same time, a tshark
+# capture. Both run until you press Enter or Ctrl-C (or for -d SECONDS); then the capture
+# and that browser are stopped. The browser runs on a profile folder of its own, apart from
+# your everyday browser, and only the instance started here is ever stopped.
 #
 # Usage:
-#   mbm-sslkeylog-capture                 # browser picker, all traffic on default iface
-#   mbm-sslkeylog-capture -b firefox      # force firefox (or: chrome)
-#   mbm-sslkeylog-capture -b chrome -i en0
-#   mbm-sslkeylog-capture -f 'tcp port 443'   # tshark capture filter
-#   mbm-sslkeylog-capture -d 60           # auto-stop after 60s (unattended)
-#   mbm-sslkeylog-capture -r              # record on all interfaces (-i any)
+#   mbm-sslkeylog-capture [-b chrome|firefox] [-i INTERFACE | -r] [-f FILTER] [-d SECONDS] [-o DIR]
 #
-# Output:
-#   keys   -> $MBM_SSLKEYLOG_DIR/logs/sslkeys/session-<ts>.log
-#   pcapng -> $MBM_SSLKEYLOG_DIR/ldumps/session-<ts>.pcapng
+# Options:
+#   -b BROWSER             chrome or firefox (default: asks on a terminal, otherwise chrome)
+#   -i INTERFACE           capture on this interface (default: the one of the default route)
+#   -r                     capture on all interfaces (tshark -i any)
+#   -f FILTER              a capture filter for tshark, for example 'tcp port 443'
+#   -d SECONDS             stop by itself after this many seconds (0: wait for Enter)
+#   -o DIR, --output DIR   the folder for the results (default: see Settings)
+#   -h, --help             show this help
 #
-set -uo pipefail
+# Results, under DIR:
+#   logs/sslkeys/session-<time>.log   the TLS keys - whoever has them can decrypt the capture
+#   ldumps/session-<time>.pcapng      the capture
+#   logs/browser-profiles/            the profile folders of the browsers started here
+#
+# Examples:
+#   mbm-sslkeylog-capture
+#   mbm-sslkeylog-capture -b firefox
+#   mbm-sslkeylog-capture -b chrome -i en0 -f 'tcp port 443'
+#   mbm-sslkeylog-capture -b chrome -d 60
+#   mbm-sslkeylog-capture -r -o ~/captures
+#
+# To read a session: open the .pcapng in Wireshark and set Preferences > Protocols > TLS >
+# "(Pre)-Master-Secret log filename" to the .log file. Or on the command line:
+#   tshark -r session.pcapng -o tls.keylog_file:session.log -Y http
+#
+# Needs: tshark that may capture (brew install wireshark; on macOS the ChmodBPF package of
+#   the Wireshark installer gives the permission), and Chrome, Chromium or Firefox.
+#   macOS and Linux.
+# Settings:
+#   MBM_SSLKEYLOG_DIR       where the results go (default: ~/.local/share/sslkeylog-capture)
+#   MBM_SSLKEYLOG_CHROME    the Chrome or Chromium program (default: Google Chrome in
+#                           /Applications, else google-chrome or chromium on the PATH)
+#   MBM_SSLKEYLOG_FIREFOX   the Firefox program (default: Firefox in /Applications, else
+#                           firefox on the PATH)
+# Exit status: 0 the session was recorded, 1 it could not start or the capture stopped early,
+#   2 wrong usage.
 
-# ------------------------------------------------------------------ config ---
-BASE="${MBM_SSLKEYLOG_DIR:-$HOME/.local/share/mbm-sslkeylog-capture}"
-KEYS_DIR="$BASE/logs/sslkeys"
-PCAP_DIR="$BASE/ldumps"
-PROFILE_DIR="$BASE/logs/browser-profiles"   # dedicated profile so we can kill only our instance
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%sslkeylog-capture}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-FIREFOX_BIN="/Applications/Firefox.app/Contents/MacOS/firefox"
+BASE="${MBM_SSLKEYLOG_DIR:-$HOME/.local/share/sslkeylog-capture}"
+BROWSER=""          # chrome | firefox | "" (ask)
+IFACE=""            # "" -> the interface of the default route; "any" with -r
+CAPFILTER=""
+DURATION=""         # "" -> until Enter or Ctrl-C
 
-BROWSER=""          # chrome | firefox | "" (pick)
-IFACE=""            # capture interface ("" -> default route iface, or "any" with -r)
-CAPFILTER=""        # tshark -f capture filter
-DURATION=""         # auto-stop seconds (0/empty -> wait for user)
-
-# -------------------------------------------------------------------- args ---
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
-
-while getopts ":b:i:f:d:rh" opt; do
+# ------------------------------------------------------------------ options
+while getopts ":b:i:f:d:o:rh-:" opt; do
   case "$opt" in
     b) BROWSER="$OPTARG" ;;
     i) IFACE="$OPTARG" ;;
     f) CAPFILTER="$OPTARG" ;;
     d) DURATION="$OPTARG" ;;
+    o) BASE="$OPTARG" ;;
     r) IFACE="any" ;;
-    h) usage 0 ;;
-    \?) echo "Unknown option: -$OPTARG" >&2; usage 1 ;;
-    :)  echo "Option -$OPTARG needs an argument" >&2; usage 1 ;;
+    h) usage; exit 0 ;;
+    -) case "$OPTARG" in          # the long options
+         help) usage; exit 0 ;;
+         output=*) BASE="${OPTARG#*=}" ;;
+         output) [ "$OPTIND" -le $# ] || bad_usage "--output needs a folder"
+                 BASE="${!OPTIND}"; OPTIND=$((OPTIND + 1)) ;;
+         *) bad_usage "unknown option: --$OPTARG" ;;
+       esac ;;
+    :) bad_usage "option -$OPTARG needs a value" ;;
+    *) bad_usage "unknown option: -$OPTARG" ;;
   esac
 done
+shift $((OPTIND - 1))
+[ $# -eq 0 ] || bad_usage "unexpected argument: $1"
+case "$BROWSER" in ''|chrome|firefox) ;; *) bad_usage "-b takes chrome or firefox, got: $BROWSER" ;; esac
+case "$DURATION" in *[!0-9]*) bad_usage "-d takes a whole number of seconds, got: $DURATION" ;; esac
+[ "${DURATION:-0}" -gt 0 ] || DURATION=""
+[ -n "$BASE" ] || bad_usage "the folder for the results is empty"
+case "$BASE" in /*) ;; *) BASE="$PWD/$BASE" ;; esac
 
-# ------------------------------------------------------------------ checks ---
-command -v tshark >/dev/null 2>&1 || { echo "ERROR: tshark not found in PATH." >&2; exit 1; }
+# ------------------------------------------------------------------ checks
+command -v tshark >/dev/null 2>&1 || die "tshark is not installed (macOS: brew install wireshark; Linux: apt install tshark)"
 
-if [[ -z "$BROWSER" ]]; then
-  echo "Which browser?"
-  echo "  1) Chrome"
-  echo "  2) Firefox"
-  read -r -p "Choice [1]: " _bchoice
-  case "${_bchoice:-1}" in
-    1|chrome|Chrome)   BROWSER=chrome ;;
-    2|firefox|Firefox) BROWSER=firefox ;;
-    *) echo "Invalid choice." >&2; exit 1 ;;
-  esac
+if [ -z "$BROWSER" ]; then
+  BROWSER=chrome
+  if [ -t 0 ]; then
+    echo "Which browser?"
+    echo "  1) Chrome"
+    echo "  2) Firefox"
+    read -r -p "Choice [1]: " choice || choice=""
+    case "${choice:-1}" in
+      1|chrome|Chrome)   BROWSER=chrome ;;
+      2|firefox|Firefox) BROWSER=firefox ;;
+      *) die "no such choice: $choice" ;;
+    esac
+  fi
 fi
 
-case "$BROWSER" in
-  chrome)  BIN="$CHROME_BIN" ;;
-  firefox) BIN="$FIREFOX_BIN" ;;
-  *) echo "ERROR: -b must be 'chrome' or 'firefox'." >&2; exit 1 ;;
-esac
-[[ -x "$BIN" ]] || { echo "ERROR: browser binary not found: $BIN" >&2; exit 1; }
-
-if [[ -z "$IFACE" ]]; then
-  IFACE="$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
-  IFACE="${IFACE:-en0}"
+# The browser program: the setting when there is one, else the usual places.
+if [ "$BROWSER" = chrome ]; then
+  SETTING=MBM_SSLKEYLOG_CHROME
+  CANDIDATES=("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" google-chrome google-chrome-stable chromium chromium-browser)
+else
+  SETTING=MBM_SSLKEYLOG_FIREFOX
+  CANDIDATES=("/Applications/Firefox.app/Contents/MacOS/firefox" firefox)
+fi
+[ -n "${!SETTING:-}" ] && CANDIDATES=("${!SETTING}")
+BIN=""
+for c in "${CANDIDATES[@]}"; do
+  p="$(command -v "$c" 2>/dev/null)" && [ -f "$p" ] && [ -x "$p" ] && { BIN="$p"; break; }
+done
+if [ -z "$BIN" ]; then
+  [ -n "${!SETTING:-}" ] && die "$SETTING names a program that is not there: ${!SETTING}"
+  die "$BROWSER was not found; set $SETTING to the program to start"
 fi
 
-mkdir -p "$KEYS_DIR" "$PCAP_DIR" "$PROFILE_DIR"
+# No interface named: the one of the default route - asked the macOS way, then the Linux
+# way. When neither answers, tshark takes its own first interface.
+if [ -z "$IFACE" ]; then
+  IFACE="$(route -n get default 2>/dev/null | awk '/interface:/ { print $2; exit }')"
+  [ -n "$IFACE" ] || IFACE="$(ip -o route show default 2>/dev/null |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')"
+fi
 
-# --------------------------------------------------------------- timestamps ---
+# The browser runs on this profile folder and on no other. PATTERN finds the processes
+# started on it and nothing else: pgrep and pkill take a regular expression, so the folder
+# name is escaped to stand for itself.
+PROFILE="$BASE/logs/browser-profiles/$BROWSER"
+escaped="$(printf '%s' "$PROFILE" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+if [ "$BROWSER" = chrome ]; then PATTERN="user-data-dir=$escaped"; else PATTERN="$escaped"; fi
+if pgrep -f -- "$PATTERN" >/dev/null 2>&1; then
+  die "a $BROWSER of an earlier session still runs on $PROFILE - close it first (it would keep writing its keys to the old file)"
+fi
+
+umask 077   # the key log decrypts the capture: keep both to yourself
+mkdir -p "$BASE/logs/sslkeys" "$BASE/ldumps" "$PROFILE" || die "cannot create the folders under $BASE"
 TS="$(date +%Y%m%d-%H%M%S)"
-KEYLOG="$KEYS_DIR/session-$TS.log"
-PCAP="$PCAP_DIR/session-$TS.pcapng"
+KEYLOG="$BASE/logs/sslkeys/session-$TS.log"
+PCAP="$BASE/ldumps/session-$TS.pcapng"
 
-# ------------------------------------------------------------------- state ---
+# ------------------------------------------------------------------ stopping
 BROWSER_PID=""
 TSHARK_PID=""
+SLEEP_PID=""
 STOPPING=0
+FROM_TERMINAL=0     # 1: stopped by Ctrl-C or by closing the terminal
 
-cleanup() {
-  [[ "$STOPPING" == 1 ]] && return
-  STOPPING=1
-  echo
-  echo ">> Stopping session ..."
-
-  if [[ -n "$TSHARK_PID" ]] && kill -0 "$TSHARK_PID" 2>/dev/null; then
-    # SIGTERM lets tshark flush and finalise the pcapng file.
-    kill -TERM "$TSHARK_PID" 2>/dev/null
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "$TSHARK_PID" 2>/dev/null || break
-      sleep 0.3
-    done
-    kill -0 "$TSHARK_PID" 2>/dev/null && kill -KILL "$TSHARK_PID" 2>/dev/null
-    wait "$TSHARK_PID" 2>/dev/null
-  fi
-  echo "   capture stopped"
-
-  if [[ -n "$BROWSER_PID" ]] && kill -0 "$BROWSER_PID" 2>/dev/null; then
-    kill -TERM "$BROWSER_PID" 2>/dev/null
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "$BROWSER_PID" 2>/dev/null || break
-      sleep 0.3
-    done
-    kill -0 "$BROWSER_PID" 2>/dev/null && kill -KILL "$BROWSER_PID" 2>/dev/null
-  fi
-  # Sweep any helper processes tied to our dedicated profile dir.
-  pkill -f "user-data-dir=$PROFILE_DIR/chrome" 2>/dev/null
-  pkill -f "$PROFILE_DIR/firefox" 2>/dev/null
-  wait 2>/dev/null
-  echo "   browser stopped"
-
-  echo
-  echo "== Session finished =="
-  echo "  SSL keys : $KEYLOG"
-  if [[ -s "$KEYLOG" ]]; then
-    echo "             $(wc -l < "$KEYLOG" | tr -d ' ') key line(s) written"
-  else
-    echo "             (no keys written — the browser may not have made a TLS connection)"
-  fi
-  echo "  Capture  : $PCAP"
-  if [[ -s "$PCAP" ]]; then
-    echo "             $(du -h "$PCAP" | cut -f1) on disk"
-  else
-    echo "             (empty capture)"
-  fi
-  echo
-  echo "  Decrypt in Wireshark: Preferences > Protocols > TLS >"
-  echo "  (Pre)-Master-Secret log filename -> $KEYLOG"
-  exit 0
+stop_pid() {   # stop_pid PID - ask it to end, wait up to 3 seconds, then force it
+  local i=0
+  kill -0 "$1" 2>/dev/null || return 0
+  kill -TERM "$1" 2>/dev/null
+  while [ "$i" -lt 30 ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+  kill -0 "$1" 2>/dev/null && kill -KILL "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+  return 0
 }
 
-trap cleanup INT TERM
-trap 'cleanup' EXIT
+cleanup() {
+  local status=0
+  [ "$STOPPING" = 1 ] && return
+  STOPPING=1
+  trap '' INT TERM HUP
+  echo
+  echo "Stopping the session ..."
+  [ -n "$SLEEP_PID" ] && kill "$SLEEP_PID" 2>/dev/null
 
-# ------------------------------------------------------------------- banner ---
-echo "=============================================="
-echo " SSL keylog + packet capture session"
-echo "=============================================="
-echo "  browser   : $BROWSER"
-echo "  interface : $IFACE"
-[[ -n "$CAPFILTER" ]] && echo "  filter    : $CAPFILTER"
-echo "  keys      : $KEYLOG"
-echo "  capture   : $PCAP"
+  if [ -n "$TSHARK_PID" ]; then
+    if kill -0 "$TSHARK_PID" 2>/dev/null; then
+      stop_pid "$TSHARK_PID"     # TERM lets tshark finish the pcapng file properly
+      echo "  capture stopped"
+    elif [ "$FROM_TERMINAL" = 1 ]; then
+      echo "  capture stopped"     # tshark got the same Ctrl-C and has finished already
+    else
+      echo "$ME: the capture had already stopped by itself - the file is incomplete" >&2
+      status=1
+    fi
+  fi
+
+  if [ -n "$BROWSER_PID" ]; then
+    stop_pid "$BROWSER_PID"
+    pkill -f -- "$PATTERN" 2>/dev/null    # helper processes of that same instance
+    echo "  browser stopped"
+  fi
+  wait 2>/dev/null
+
+  echo
+  echo "Session finished"
+  if [ -s "$KEYLOG" ]; then
+    echo "  TLS keys: $KEYLOG ($(wc -l < "$KEYLOG" | tr -d ' ') line(s))"
+  else
+    echo "  TLS keys: none written - the browser made no TLS connection"
+  fi
+  if [ -s "$PCAP" ]; then
+    echo "  Capture:  $PCAP ($(du -h "$PCAP" | cut -f1))"
+  else
+    echo "  Capture:  empty"
+  fi
+  if [ -s "$KEYLOG" ] && [ -s "$PCAP" ]; then
+    echo
+    echo "To decrypt: open the capture in Wireshark and set Preferences > Protocols > TLS >"
+    echo "\"(Pre)-Master-Secret log filename\" to the TLS keys file."
+  fi
+  exit "$status"
+}
+trap 'FROM_TERMINAL=1; cleanup' INT HUP   # the terminal sends these to tshark and the browser too
+trap cleanup TERM EXIT
+
+# ------------------------------------------------------------------ capture
+echo "Browser:   $BROWSER ($BIN)"
+echo "Interface: ${IFACE:-the first one tshark finds}"
+[ -n "$CAPFILTER" ] && echo "Filter:    $CAPFILTER"
+echo "TLS keys:  $KEYLOG"
+echo "Capture:   $PCAP"
 echo
 
-# ---------------------------------------------------------------- start tshark ---
-TSHARK_ARGS=( -i "$IFACE" -w "$PCAP" -s 0 -q )
-[[ -n "$CAPFILTER" ]] && TSHARK_ARGS+=( -f "$CAPFILTER" )
-
-echo ">> Starting tshark capture ..."
+TSHARK_ARGS=(-w "$PCAP" -s 0 -q)
+[ -n "$IFACE" ] && TSHARK_ARGS=(-i "$IFACE" "${TSHARK_ARGS[@]}")
+[ -n "$CAPFILTER" ] && TSHARK_ARGS+=(-f "$CAPFILTER")
 tshark "${TSHARK_ARGS[@]}" 2> >(sed 's/^/[tshark] /' >&2) &
 TSHARK_PID=$!
 
 sleep 1
 if ! kill -0 "$TSHARK_PID" 2>/dev/null; then
-  echo "ERROR: tshark failed to start. If it is a permissions problem, grant" >&2
-  echo "       capture rights (Wireshark 'ChmodBPF') or run this script with sudo." >&2
-  exit 1
+  # Nothing else runs yet: no session to stop, nothing to keep.
+  trap - INT TERM HUP EXIT
+  [ -s "$PCAP" ] || rm -f -- "$PCAP"
+  die "tshark could not start the capture (its message is above). Without the permission to capture: on macOS install ChmodBPF (it comes with the Wireshark installer), on Linux join the wireshark group."
 fi
-echo "   tshark PID $TSHARK_PID"
+echo "Capture started (tshark, process $TSHARK_PID)"
 
-# --------------------------------------------------------------- start browser ---
-# Chrome ignores env vars inherited by a running instance, so we point it at a
-# dedicated user-data-dir to guarantee a fresh, isolated process that receives
-# SSLKEYLOGFILE. Firefox uses -no-remote + its own profile for the same reason.
-echo ">> Starting $BROWSER (SSLKEYLOGFILE set) ..."
+# ------------------------------------------------------------------ browser
+# A running browser does not pick up SSLKEYLOGFILE, so this is a fresh one: Chrome on its
+# own --user-data-dir, Firefox with -no-remote on its own profile.
 export SSLKEYLOGFILE="$KEYLOG"
-
-if [[ "$BROWSER" == "chrome" ]]; then
-  "$BIN" \
-    --user-data-dir="$PROFILE_DIR/chrome" \
-    --no-first-run --no-default-browser-check \
-    --new-window "about:blank" \
-    >/dev/null 2>&1 &
-  BROWSER_PID=$!
+if [ "$BROWSER" = chrome ]; then
+  "$BIN" --user-data-dir="$PROFILE" --no-first-run --no-default-browser-check \
+    --new-window "about:blank" >/dev/null 2>&1 &
 else
-  "$BIN" \
-    -no-remote \
-    -profile "$PROFILE_DIR/firefox" \
-    -new-instance \
-    >/dev/null 2>&1 &
-  BROWSER_PID=$!
+  "$BIN" -no-remote -profile "$PROFILE" -new-instance >/dev/null 2>&1 &
 fi
-echo "   browser PID $BROWSER_PID"
-
-# --------------------------------------------------------------- run / wait ---
+BROWSER_PID=$!
+echo "Browser started (process $BROWSER_PID)"
 echo
-echo "----------------------------------------------"
-if [[ -n "$DURATION" ]]; then
-  echo " Capturing for ${DURATION}s, then auto-stopping."
-  sleep "$DURATION"
-  cleanup
+
+# ------------------------------------------------------------------ wait
+if [ -n "$DURATION" ]; then
+  echo "Recording for $DURATION seconds (Ctrl-C stops earlier)."
+  sleep "$DURATION" &      # in the background, so that Ctrl-C and a TERM signal act at once
+  SLEEP_PID=$!
+  wait "$SLEEP_PID"
 else
-  echo " Session is live. Browse now."
-  echo " Press [Enter] (or Ctrl-C) to stop the browser and the capture."
-  echo "----------------------------------------------"
-  if read -r _; then
-    cleanup
-  else
-    # stdin closed (e.g. piped) — fall back to waiting on the browser.
-    echo " (stdin closed; waiting for the browser window to close ...)"
-    wait "$BROWSER_PID" 2>/dev/null
-    cleanup
+  printf 'Recording. Browse now, then press Enter (or Ctrl-C) to stop the browser and the capture: '
+  if ! read -r _; then
+    echo "(standard input is closed: waiting for the browser to be closed)"
+    wait "$BROWSER_PID"
   fi
 fi
+cleanup

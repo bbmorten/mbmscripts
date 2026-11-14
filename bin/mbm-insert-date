@@ -1,21 +1,115 @@
-#!/bin/zsh
+#!/usr/bin/env bash
+# mbm-insert-date - replace the placeholder {{DATE}} in files with today's date
+#
+# Usage:
+#   mbm-insert-date [-n] [-f FORMAT] [-p TEXT] FILE...
+#
+# Options:
+#   -f, --format FORMAT     how the date is written, as for date(1) (default: %Y-%m-%d)
+#   -p, --placeholder TEXT  the text to replace, taken letter for letter (default: {{DATE}})
+#   -n, --dry-run           show the lines that would change, as they would be; change nothing
+#   -h, --help              show this help
+#
+# Examples:
+#   mbm-insert-date notes/today.md
+#   mbm-insert-date -f '%d.%m.%Y' -p '<TODAY>' letter.md invoice.md
+#   mbm-insert-date -n -f '%A, %d %B %Y' draft.md
+#
+# Every occurrence is replaced, in the file itself: it keeps its permissions, and a
+# symbolic link stays a link (the file it points to is changed). A file without the
+# placeholder is not written at all. One line per file says how many replacements were made.
+#
+# Exit status: 0 done, 1 a file is missing or could not be written, 2 wrong usage.
 
-# Check if the filename argument is provided
-if [ $# -eq 0 ]; then
-  echo "Usage: mbm-insert-date <filename.md>"
-  exit 1
-fi
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%insert-date}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-# Store the filename provided as an argument
-filename="$1"
+DRY=0
+FORMAT='%Y-%m-%d'
+PLACEHOLDER='{{DATE}}'
+ARGS=()   # what is not an option; options may stand anywhere before a "--"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -f|--format)
+      [ $# -ge 2 ] && [ -n "$2" ] || bad_usage "$1 needs a date format"
+      FORMAT="$2"
+      shift ;;
+    -p|--placeholder)
+      [ $# -ge 2 ] && [ -n "$2" ] || bad_usage "$1 needs the text to replace"
+      PLACEHOLDER="$2"
+      shift ;;
+    --) shift; while [ $# -gt 0 ]; do ARGS[${#ARGS[@]}]="$1"; shift; done; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) ARGS[${#ARGS[@]}]="$1" ;;
+  esac
+  shift
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+[ $# -ge 1 ] || bad_usage "no file given"
 
-# Create a temporary file
-tmpfile=$(mktemp)
+today="$(date "+$FORMAT")" || die "date does not accept the format '$FORMAT'"
+[ -n "$today" ] || die "the format '$FORMAT' gives an empty date"
 
-# Replace {{DATE}} with the current date and write to the temporary file
-sed "s/{{DATE}}/$(date '+%Y-%m-%d')/g" "$filename" > "$tmpfile"
+tmp="$(mktemp)" || die "cannot make a temporary file"
+trap 'rm -f "$tmp"' EXIT
 
-# Move the temporary file to overwrite the original Markdown file
-mv "$tmpfile" "$filename"
+# replace FILE - the new text goes to $tmp, the report to standard output.
+# Exit status 0: something was replaced; 3: the placeholder is not in the file.
+# The values travel in the environment so that awk takes them letter for letter, and the
+# C locale makes index() and substr() count the same way everywhere.
+replace() {
+  # shellcheck disable=SC2094  # the file is only read here; awk writes to $tmp
+  _NAME="$1" _OLD="$PLACEHOLDER" _NEW="$today" _TMP="$tmp" _DRY="$DRY" _END="$2" LC_ALL=C awk '
+    BEGIN {
+      name = ENVIRON["_NAME"]; old = ENVIRON["_OLD"]; new = ENVIRON["_NEW"]
+      tmp = ENVIRON["_TMP"]; dry = ENVIRON["_DRY"]; len = length(old)
+      printf "" > tmp
+    }
+    {
+      head = ""; rest = $0; hits = 0
+      while ((i = index(rest, old)) > 0) {
+        head = head substr(rest, 1, i - 1) new
+        rest = substr(rest, i + len)
+        hits++
+      }
+      total += hits
+      printf "%s%s", (NR > 1 ? "\n" : ""), head rest > tmp
+      if (hits && dry == 1) printf "%s:%d: %s\n", name, NR, head rest
+    }
+    END {
+      if (NR > 0 && ENVIRON["_END"] == 1) printf "\n" > tmp
+      if (!total) { printf "%s: no %s in it, not changed\n", name, old; exit 3 }
+      printf "%s: %d x %s %s %s\n", name, total, old, (dry == 1 ? "would be replaced with" : "replaced with"), new
+    }' < "$1"
+}
 
-
+failed=0
+for f in "$@"; do
+  if [ ! -f "$f" ]; then
+    echo "$ME: not a file: $f" >&2
+    failed=1
+    continue
+  elif [ ! -r "$f" ] || { [ "$DRY" = 0 ] && [ ! -w "$f" ]; }; then
+    echo "$ME: no permission to change $f" >&2
+    failed=1
+    continue
+  fi
+  # 1 when the file ends with a line end, so that it is written back the same way
+  if [ -z "$(tail -c 1 < "$f")" ]; then end=1; else end=0; fi
+  replace "$f" "$end"
+  case $? in
+    0) if [ "$DRY" = 0 ] && ! cat "$tmp" > "$f"; then
+         echo "$ME: could not write $f" >&2
+         failed=1
+       fi ;;
+    3) ;;
+    *) echo "$ME: could not read $f" >&2; failed=1 ;;
+  esac
+done
+exit "$failed"

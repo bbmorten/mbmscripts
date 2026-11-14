@@ -1,187 +1,177 @@
 #!/usr/bin/env bash
-#
-# mbm-sync-git-msp — Sync local git-msp folder to remote host via rsync
+# mbm-sync-git-msp - mirror a local folder to a folder on a remote host, with rsync over ssh
 #
 # Usage:
-#   mbm-sync-git-msp              # normal sync
-#   mbm-sync-git-msp --dry-run    # preview changes, don't touch anything
-#   mbm-sync-git-msp --watch      # auto-sync on file changes (requires fswatch)
-#   mbm-sync-git-msp --help       # show help
+#   mbm-sync-git-msp [options]
 #
+# The remote folder becomes a copy of the local one: new and changed files are sent, and
+# files on the remote side that are no longer in the local folder are DELETED there
+# (rsync --delete). Run it with --dry-run first; that lists what would be sent and deleted.
+# These are left alone on both sides, never sent and never deleted: .git/ node_modules/
+# .next/ .nuxt/ dist/ build/ out/ __pycache__/ *.pyc .venv/ venv/ .env .env.local vendor/
+# .DS_Store *.log .idea/ .vscode/ coverage/ .cache/
+#
+# This is the plain one: it prints rsync's list of files. mbm-sync-git-msp-v2 does the same
+# job with a progress line, a summary of each run and a history of the runs.
+#
+# Options:
+#   -s, --source DIR    local folder to send (default: ~/git-msp/)
+#   -H, --host HOST     remote host, as HOST or USER@HOST (no default)
+#   -u, --user USER     user on the remote host (default: your local user name)
+#   -d, --dest DIR      folder on the remote host, relative to the home folder there
+#                       unless it starts with / (default: git-msp/)
+#   -x, --exclude PAT   leave out one more rsync pattern; may be given several times
+#   -n, --dry-run       list what would be sent and deleted; change nothing
+#   -w, --watch         sync now, then again after every change in the local folder,
+#                       until Ctrl+C; changes that come together make one sync
+#   -y, --yes           do not ask before syncing
+#   -h, --help          show this help
+# A long option also takes its value as --option=VALUE, for example --host=nas.example.com.
+#
+# Examples:
+#   mbm-sync-git-msp -H nas.example.com --dry-run
+#   mbm-sync-git-msp -H nas.example.com
+#   mbm-sync-git-msp -s ~/Projects/site -H web1.example.com -u deploy -d /srv/site -x '*.tmp'
+#   mbm-sync-git-msp -H nas.example.com --watch --yes
+#
+# Needs: rsync and ssh; --watch also needs fswatch (brew install fswatch). macOS and Linux.
+# Settings (each one is the default of an option):
+#   MBM_SYNC_SOURCE_DIR   --source
+#   MBM_REMOTE_HOST       --host
+#   MBM_REMOTE_USER       --user
+#   MBM_SYNC_REMOTE_DIR   --dest
+# Files: ~/.local/log/sync-git-msp/sync-YYYY-MM-DD.log keeps what each run printed.
+# Exit status: 0 synced, 1 the sync failed or was not confirmed, 2 wrong usage.
 
-set -euo pipefail
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%sync-git-msp}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-# ─── Configuration ──────────────────────────────────────────────────────────
-SOURCE_DIR="${MBM_SYNC_SOURCE_DIR:-$HOME/git-msp/}"
-REMOTE_USER="${MBM_REMOTE_USER:-$USER}"
-REMOTE_HOST="${MBM_REMOTE_HOST:-}"
-REMOTE_DIR="${MBM_SYNC_REMOTE_DIR:-git-msp/}"
+SRC="${MBM_SYNC_SOURCE_DIR:-$HOME/git-msp/}"
+HOST="${MBM_REMOTE_HOST:-}"
+RUSER="${MBM_REMOTE_USER:-${USER:-$(id -un)}}"
+DEST="${MBM_SYNC_REMOTE_DIR:-git-msp/}"
+DRY=0
+WATCH=0
+YES=0
+EXCLUDES=(.git/ node_modules/ .next/ .nuxt/ dist/ build/ out/ __pycache__/ '*.pyc' .venv/ venv/
+          .env .env.local vendor/ .DS_Store '*.log' .idea/ .vscode/ coverage/ .cache/)
 
-# SSH options (uncomment and adjust if needed)
-# SSH_PORT=22
-# SSH_KEY="$HOME/.ssh/id_ed25519"
-# SSH_OPTS="-e \"ssh -p ${SSH_PORT} -i ${SSH_KEY}\""
-
-# Log directory and file
-LOG_DIR="$HOME/.local/log/sync-git-msp"
-LOG_FILE="${LOG_DIR}/sync-$(date +%Y-%m-%d).log"
-
-# Exclude patterns — adjust to taste
-EXCLUDES=(
-  --exclude='.git/'
-  --exclude='node_modules/'
-  --exclude='.next/'
-  --exclude='.nuxt/'
-  --exclude='dist/'
-  --exclude='build/'
-  --exclude='out/'
-  --exclude='__pycache__/'
-  --exclude='*.pyc'
-  --exclude='.venv/'
-  --exclude='venv/'
-  --exclude='.env'
-  --exclude='.env.local'
-  --exclude='vendor/'
-  --exclude='.DS_Store'
-  --exclude='*.log'
-  --exclude='.idea/'
-  --exclude='.vscode/'
-  --exclude='coverage/'
-  --exclude='.cache/'
-)
-
-# ─── Helpers ────────────────────────────────────────────────────────────────
-RED=$'\033[0;31m'
-GREEN=$'\033[0;32m'
-YELLOW=$'\033[0;33m'
-BLUE=$'\033[0;34m'
-NC=$'\033[0m'
-
-log() {
-  local level="$1"; shift
-  local msg="$*"
-  local ts
-  ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  local color="$NC"
-  case "$level" in
-    INFO)  color="$BLUE"   ;;
-    OK)    color="$GREEN"  ;;
-    WARN)  color="$YELLOW" ;;
-    ERROR) color="$RED"    ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1; shift ;;
+    -w|--watch) WATCH=1; shift ;;
+    -y|--yes) YES=1; shift ;;
+    --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;   # --host=NAME is --host NAME
+    -s|--source|-H|--host|-u|--user|-d|--dest|-x|--exclude)
+      [ $# -ge 2 ] || bad_usage "option $1 needs a value"
+      case "$1" in
+        -s|--source) SRC="$2" ;;
+        -H|--host) HOST="$2" ;;
+        -u|--user) RUSER="$2" ;;
+        -d|--dest) DEST="$2" ;;
+        *) EXCLUDES+=("$2") ;;
+      esac
+      shift 2 ;;
+    --) shift; [ $# -eq 0 ] || bad_usage "unexpected argument: $1" ;;
+    -*) bad_usage "unknown option: $1" ;;
+    *) bad_usage "unexpected argument: $1" ;;
   esac
-  # Print to terminal (colored) and to log file (plain)
-  printf '%s[%s] [%s]%s %s\n' "$color" "$ts" "$level" "$NC" "$msg"
-  printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE"
+done
+
+[ -n "$HOST" ] || bad_usage "no remote host: use --host HOST or set MBM_REMOTE_HOST"
+case "$HOST" in *@*) TARGET="$HOST" ;; *) TARGET="$RUSER@$HOST" ;; esac
+case "$TARGET" in -*|*@-*|*@) bad_usage "not a host name: $HOST" ;; esac
+# shellcheck disable=SC2088  # the tilde is meant as text: rsync would hand it to the remote shell
+case "$DEST" in
+  ''|.|./|/|'~'|'~/') bad_usage "--dest '$DEST' is a whole home or root folder; name a folder inside it" ;;
+esac
+[ -d "$SRC" ] || die "source folder not found: $SRC"
+# An absolute path with one slash at the end: rsync then sends what is IN the folder.
+SRC="$(CDPATH='' cd -- "$SRC" && pwd)" || die "cannot open the source folder: $SRC"
+SRC="${SRC%/}/"
+[ -n "$(ls -A -- "$SRC" 2>/dev/null)" ] ||
+  die "the source folder is empty: $SRC - not syncing, that would delete everything in $TARGET:$DEST"
+command -v rsync >/dev/null 2>&1 || die "rsync is not installed (Linux: apt install rsync)"
+command -v ssh >/dev/null 2>&1 || die "ssh is not installed (Linux: apt install openssh-client)"
+if [ "$WATCH" = 1 ]; then
+  command -v fswatch >/dev/null 2>&1 || die "fswatch is not installed (brew install fswatch); --watch needs it"
+fi
+
+confirm() {   # confirm "Delete 3 files?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
-show_help() {
-  cat <<EOF
-mbm-sync-git-msp — Sync ${SOURCE_DIR} → ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}
-
-Usage:
-  $0              Normal sync (mirror with --delete)
-  $0 --dry-run    Preview changes without modifying anything
-  $0 --watch      Continuously watch for changes and auto-sync (needs fswatch)
-  $0 --help       Show this help
-
-Logs are written to: ${LOG_DIR}/
-EOF
+LOG_DIR="$HOME/.local/log/sync-git-msp"
+logfile() { echo "$LOG_DIR/sync-$(date +%Y-%m-%d).log"; }   # per call: a watch can run past midnight
+log() {       # log LEVEL TEXT - one line on the terminal and in the log file
+  printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" | tee -a "$(logfile)"
 }
+
+RSYNC=(rsync -avz --human-readable --stats --delete)
+for p in "${EXCLUDES[@]}"; do RSYNC+=("--exclude=$p"); done
+NOTE=""
+[ "$DRY" = 1 ] && { RSYNC+=(--dry-run); NOTE="dry run, nothing is changed: "; }
+RSYNC+=(-- "$SRC" "$TARGET:$DEST")
 
 run_sync() {
-  local extra_flags=("$@")
-  local rsync_cmd=(
-    rsync
-    -avz
-    --human-readable
-    --stats
-    --delete
-    "${EXCLUDES[@]}"
-    "${extra_flags[@]}"
-    "$SOURCE_DIR"
-    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
-  )
-
-  log INFO "Starting rsync: ${SOURCE_DIR} → ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
-  log INFO "Command: ${rsync_cmd[*]}"
-
-  local start_ts end_ts duration
-  start_ts=$(date +%s)
-
-  # Run rsync, tee output to both terminal and log file
-  if "${rsync_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-    end_ts=$(date +%s)
-    duration=$((end_ts - start_ts))
-    log OK "Sync completed successfully in ${duration}s"
+  local start rc
+  log INFO "$NOTE$SRC -> $TARGET:$DEST"
+  log RUN "${RSYNC[*]}" >/dev/null
+  start="$(date +%s)"
+  "${RSYNC[@]}" 2>&1 | tee -a "$(logfile)"
+  rc="${PIPESTATUS[0]}"
+  if [ "$rc" -eq 0 ]; then
+    log OK "done in $(($(date +%s) - start))s"
     return 0
-  else
-    local rc=${PIPESTATUS[0]}
-    end_ts=$(date +%s)
-    duration=$((end_ts - start_ts))
-    log ERROR "Sync failed with exit code ${rc} after ${duration}s"
-    return "$rc"
   fi
+  log ERROR "rsync failed with exit code $rc" >/dev/null
+  echo "$ME: rsync failed with exit code $rc (log: $(logfile))" >&2
+  return 1
 }
 
-watch_mode() {
-  if ! command -v fswatch >/dev/null 2>&1; then
-    log ERROR "fswatch is required for --watch mode. Install with: brew install fswatch"
-    exit 1
-  fi
+if [ "$DRY" = 0 ]; then
+  confirm "Mirror $SRC to $TARGET:$DEST? Files there that are not in the local folder are deleted." ||
+    die "nothing synced"
+fi
+mkdir -p "$LOG_DIR" || die "cannot create the log folder: $LOG_DIR"
 
-  log INFO "Watch mode active. Monitoring ${SOURCE_DIR} for changes... (Ctrl+C to stop)"
-
-  # Initial sync on start
-  run_sync || log WARN "Initial sync failed, continuing to watch..."
-
-  # Build a fswatch exclude regex from the rsync excludes (best-effort)
-  fswatch -o \
-    --exclude='\.git/' \
-    --exclude='node_modules/' \
-    --exclude='\.next/' \
-    --exclude='dist/' \
-    --exclude='build/' \
-    --exclude='__pycache__/' \
-    --exclude='\.venv/' \
-    --exclude='\.DS_Store' \
-    "$SOURCE_DIR" \
-  | while read -r _; do
-      log INFO "Change detected, syncing..."
-      run_sync || log WARN "Sync failed, will retry on next change"
-    done
-}
-
-if [[ -z "$REMOTE_HOST" && "${1:-}" != "-h" && "${1:-}" != "--help" ]]; then
-  echo "No remote host is set. Export MBM_REMOTE_HOST (for example in the local.env file of your installation)." >&2
-  exit 1
+if [ "$WATCH" = 0 ]; then
+  run_sync
+  exit $?
 fi
 
-# ─── Main ───────────────────────────────────────────────────────────────────
-mkdir -p "$LOG_DIR"
-
-# Sanity check
-if [[ ! -d "$SOURCE_DIR" ]]; then
-  log ERROR "Source directory does not exist: $SOURCE_DIR"
-  exit 1
-fi
-
-case "${1:-}" in
-  -h|--help)
-    show_help
-    ;;
-  -n|--dry-run)
-    log INFO "DRY RUN — no changes will be made"
-    run_sync --dry-run
-    ;;
-  -w|--watch)
-    watch_mode
-    ;;
-  '')
-    run_sync
-    ;;
-  *)
-    log ERROR "Unknown option: $1"
-    show_help
-    exit 1
-    ;;
-esac
+# fswatch takes regular expressions on whole paths; the rsync patterns are turned into them
+# as well as that goes (.git/ becomes /\.git(/|$)). A miss only costs a sync with nothing to do.
+FSWATCH=(fswatch -o -r -E)
+for p in "${EXCLUDES[@]}"; do
+  FSWATCH+=("--exclude=/$(printf '%s' "${p%/}" | sed -e 's/[][\.^$+?(){}|]/\\&/g' -e 's/\*/[^\/]*/g')(/|\$)")
+done
+# fswatch runs beside the loop and writes into a named pipe. A change during a sync waits
+# there, and when this script ends, however it ends, fswatch is stopped with it.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/sync-watch.XXXXXX")" || die "cannot create a temporary folder"
+WATCHER=""
+trap '[ -n "$WATCHER" ] && kill "$WATCHER" 2>/dev/null; rm -rf "$WORK"' EXIT
+mkfifo "$WORK/changes" || die "cannot create a pipe in $WORK"
+"${FSWATCH[@]}" "$SRC" > "$WORK/changes" &
+WATCHER=$!
+exec 3< "$WORK/changes"
+log INFO "watching $SRC (Ctrl+C stops)"
+run_sync </dev/null
+while read -r _; do
+  while read -r -t 1 _; do :; done   # wait for a quiet second: a burst of changes is one sync
+  run_sync </dev/null
+done <&3
+wait "$WATCHER"
+rc=$?
+WATCHER=""
+[ "$rc" -eq 0 ] || die "fswatch stopped with exit status $rc"

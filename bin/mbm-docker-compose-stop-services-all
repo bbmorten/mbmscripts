@@ -1,10 +1,103 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-docker-compose-stop-services-all - shut down every running Docker Compose project
+#
+# Usage:
+#   mbm-docker-compose-stop-services-all [-s] [-n] [-y] [-e ENGINE]
+#
+# Options:
+#   -s, --stop                   only stop the containers and keep them ("docker compose stop")
+#   -n, --dry-run                list the projects and print the commands; change nothing
+#   -y, --yes                    do not ask before going ahead
+#   -e ENGINE, --engine ENGINE   the program to run (default: docker)
+#   -h, --help                   show this help
+#
+# It lists the running projects ("docker compose ls -q"), asks, and then runs
+# "docker compose -p NAME down" for each one. "down" stops the containers AND removes them
+# together with the project's networks; named volumes and images stay. What a container
+# wrote outside a volume is lost. With -s the containers are only stopped: nothing is removed
+# and "docker compose -p NAME start" brings them back as they were.
+#
+# Examples:
+#   mbm-docker-compose-stop-services-all
+#   mbm-docker-compose-stop-services-all -n
+#   mbm-docker-compose-stop-services-all -s -y
+#
+# Exit status: 0 done, or nothing was running; 1 a project failed, or you answered no;
+# 2 called wrongly.
+# Needs: docker with the compose plugin (https://docs.docker.com/get-docker/).
+# Settings: MBM_CONTAINER_ENGINE   the engine when -e is not given (default: docker)
 
-# Get the list of running Docker Compose projects
-projects=$(docker compose ls | awk 'NR>1 {print $1}')
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%docker-compose-stop-services-all}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+confirm() {   # confirm "Delete 3 files?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
 
-# Loop through each project and run `docker compose down`
-for project in $projects; do
-  echo "Stopping project $project..."
-  docker compose -p $project down
+ENGINE="${MBM_CONTAINER_ENGINE:-docker}"
+ACTION=down
+DRY=0
+YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -s|--stop) ACTION=stop ;;
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    -e|--engine) [ $# -ge 2 ] || bad_usage "$1 needs a value"; ENGINE="$2"; shift ;;
+    --engine=*) ENGINE="${1#*=}" ;;
+    --) shift; break ;;
+    -*) bad_usage "unknown option $1" ;;
+    *) break ;;
+  esac
+  shift
 done
+[ $# -eq 0 ] || bad_usage "unexpected argument: $1"
+[ -n "$ENGINE" ] || bad_usage "the engine name is empty"
+command -v "$ENGINE" >/dev/null 2>&1 ||
+  die "$ENGINE is not installed (Docker: https://docs.docker.com/get-docker/; another engine: -e NAME)"
+
+list="$("$ENGINE" compose ls -q)" || die "could not list the Compose projects (is $ENGINE running?)"
+projects=()
+while IFS= read -r name; do
+  [ -n "$name" ] && projects+=("$name")
+done <<EOF_PROJECTS
+$list
+EOF_PROJECTS
+count="${#projects[@]}"
+if [ "$count" -eq 0 ]; then
+  echo "No Compose project is running."
+  exit 0
+fi
+
+echo "Running Compose projects ($count):"
+printf '  %s\n' "${projects[@]}"
+if [ "$DRY" = 1 ]; then
+  echo "Dry run. These commands would run:"
+  for name in "${projects[@]}"; do
+    printf '  %q compose -p %q %s\n' "$ENGINE" "$name" "$ACTION"
+  done
+  exit 0
+fi
+if [ "$ACTION" = down ]; then
+  question="Stop every project listed above and remove its containers and networks?"
+else
+  question="Stop the containers of every project listed above?"
+fi
+confirm "$question" || die "cancelled; nothing was changed"
+
+failed=""
+for name in "${projects[@]}"; do
+  echo "Project $name: $ACTION"
+  "$ENGINE" compose -p "$name" "$ACTION" || failed="$failed $name"
+done
+[ -z "$failed" ] || die "\"compose $ACTION\" failed for:$failed"
+exit 0

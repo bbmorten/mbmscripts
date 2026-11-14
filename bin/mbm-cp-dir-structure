@@ -1,28 +1,111 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-cp-dir-structure - copy the folders of a tree, without the files in them
+#
+# Usage:
+#   mbm-cp-dir-structure [-n] [-v] SRC DST
+#
+# Arguments:
+#   SRC   the folder whose tree is copied
+#   DST   the folder that receives it; it is made when missing. What is inside SRC goes
+#         inside DST: SRC/a/b becomes DST/a/b, whether or not DST exists already.
+#
+# Options:
+#   -n, --dry-run   list the folders that would be made; make nothing
+#   -v, --verbose   list every folder as it is made
+#   -h, --help      show this help
+#
+# Examples:
+#   mbm-cp-dir-structure ~/Projects/site ~/Projects/site-skeleton
+#   mbm-cp-dir-structure -n photos/2024 photos/2025
+#
+# Folders that exist already are left as they are, and nothing is ever removed. Symbolic
+# links are not followed. DST may lie inside SRC: it is not copied into itself.
+# To copy the files as well, use mbm-cp-dir-structure-w-files.
+#
+# Exit status: 0 done, 1 a folder could not be read or made, 2 wrong usage.
 
-# Check that the script was invoked with the correct number of arguments
-if [ "$#" -ne 2 ]; then
-    echo "Usage: $0 <source_directory> <target_directory>"
-    exit 1
-fi
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%cp-dir-structure}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-# Set the source and target directories
-source_dir=$1
-target_dir=$2
-
-# Create the target directory if it doesn't exist
-if [ ! -d "$target_dir" ]; then
-    mkdir -p "$target_dir"
-fi
-
-# Copy the directory structure recursively from the source directory to the target directory
-find "$source_dir" -type d -print0 | while read -d $'\0' dir
-do
-    # Create the target directory if it doesn't exist
-    target_subdir="${dir/$source_dir/$target_dir}"
-    if [ ! -d "$target_subdir" ]; then
-        mkdir -p "$target_subdir"
-    fi
+DRY=0
+VERBOSE=0
+ARGS=()   # what is not an option; options may stand anywhere before a "--"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -v|--verbose) VERBOSE=1 ;;
+    --) shift; while [ $# -gt 0 ]; do ARGS[${#ARGS[@]}]="$1"; shift; done; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) ARGS[${#ARGS[@]}]="$1" ;;
+  esac
+  shift
 done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+[ $# -eq 2 ] || bad_usage "expected SRC and DST, got $# arguments"
+[ -n "$1" ] && [ -n "$2" ] || bad_usage "SRC and DST must not be empty"
+src="$1"
+dst="$2"
+while [ "$dst" != / ] && [ "${dst%/}" != "$dst" ]; do dst="${dst%/}"; done
 
-echo "Directory structure copied from $source_dir to $target_dir"
+[ -d "$src" ] || die "not a folder: $src"
+[ ! -e "$dst" ] || [ -d "$dst" ] || die "exists and is not a folder: $dst"
+
+# phys PATH - the physical absolute path of a folder that may not exist yet
+phys() {
+  local p="$1" rest="" base
+  case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+  while [ ! -d "$p" ]; do
+    rest="/${p##*/}$rest"
+    p="${p%/*}"
+    [ -n "$p" ] || p=/
+  done
+  base="$(cd -- "$p" && pwd -P)" || return 1
+  printf '%s%s\n' "${base%/}" "$rest"
+}
+
+src_abs="$(cd -- "$src" && pwd -P)" || die "cannot enter $src"
+dst_abs="$(phys "$dst")" || die "cannot work out where $dst is"
+[ "${src_abs%/}" != "$dst_abs" ] || die "SRC and DST are the same folder"
+# When DST lies inside SRC: its path relative to SRC, to leave it out of the copy.
+inside=""
+case "$dst_abs" in "${src_abs%/}"/*) inside="./${dst_abs#"${src_abs%/}"/}" ;; esac
+
+list="$(mktemp)" || die "cannot make a temporary file"
+trap 'rm -f "$list"' EXIT
+failed=0
+# The list is complete before the first folder is made, and it holds paths relative to SRC.
+(cd -- "$src" && find . -type d -print0) > "$list" || failed=1
+
+made=0
+had=0
+while IFS= read -r -d '' d; do
+  if [ -n "$inside" ]; then
+    case "$d" in "$inside"|"$inside"/*) continue ;; esac
+  fi
+  if [ "$d" = . ]; then t="$dst"; else t="${dst%/}/${d#./}"; fi
+  if [ -d "$t" ]; then
+    had=$((had + 1))
+    continue
+  fi
+  if [ "$DRY" = 1 ]; then
+    printf '%s\n' "$t"
+  elif mkdir -p -- "$t"; then
+    [ "$VERBOSE" = 0 ] || printf '%s\n' "$t"
+  else
+    failed=1
+    continue
+  fi
+  made=$((made + 1))
+done < "$list"
+
+if [ "$DRY" = 1 ]; then
+  echo "Dry run - folders that would be made in $dst: $made; there already: $had."
+else
+  echo "Folders made in $dst: $made; there already: $had."
+fi
+[ "$failed" = 0 ] || die "some folders could not be read or made (see the messages above)"

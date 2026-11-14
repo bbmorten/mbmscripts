@@ -1,23 +1,92 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-eth-conv - count the frames exchanged by each pair of Ethernet addresses in a capture file
+#
+# Usage:
+#   mbm-eth-conv [-j] [-t N] FILE
+#
+# Arguments:
+#   FILE            a capture file that tshark can read (pcap, pcapng, ...)
+#
+# Options:
+#   -j, --json      print one JSON array instead of the table
+#   -t N, --top N   print only the N busiest pairs
+#   -h, --help      show this help
+#
+# A to B and B to A are one conversation. The busiest pair comes first: address A,
+# address B, number of frames. A frame without an Ethernet header is not counted; how many
+# there were is said on standard error. Of a frame that carries Ethernet inside a tunnel,
+# the outer addresses count. Of a file that was cut short, the part that can be read is
+# counted and the exit status is 1.
+#
+# Examples:
+#   mbm-eth-conv capture.pcapng
+#   mbm-eth-conv -t 5 capture.pcapng
+#   mbm-eth-conv --json capture.pcapng > pairs.json
+#
+# Needs: tshark (macOS: brew install wireshark; Linux: apt install tshark). macOS and Linux.
+# Exit status: 0 done, 1 the file could not be read to its end, 2 wrong usage.
 
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <file.pcap>"
-    exit 1
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%eth-conv}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+JSON=0
+TOP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -j|--json) JSON=1; shift ;;
+    -t|--top) [ $# -ge 2 ] || bad_usage "$1 needs a number"; TOP="$2"; shift 2 ;;
+    --top=*) TOP="${1#*=}"; shift ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+[ $# -ge 1 ] || bad_usage "no capture file given"
+[ $# -eq 1 ] || bad_usage "one capture file at a time, got $#"
+FILE="$1"
+if [ -n "$TOP" ]; then
+  case "$TOP" in *[!0-9]*|0) bad_usage "-t needs a whole number above 0, got: $TOP" ;; esac
 fi
 
-if [ ! -f "$1" ]; then
-    echo "Error: $1 is not a file."
-    exit 1
-fi
+command -v tshark >/dev/null 2>&1 || die "tshark is not installed (macOS: brew install wireshark; Linux: apt install tshark)"
+[ -e "$FILE" ] || die "no such file: $FILE"
+[ -f "$FILE" ] || die "not a file: $FILE"
 
-tshark -r "$1" -T fields -e eth.src -e eth.dst | \
-gawk '{
-    key = ($1 < $2 ? $1 "," $2 : $2 "," $1); # Use a comma as separator
-    arr[key]++;
-}
-END {
-    for (key in arr) {
-        n = split(key, macs, ","); # Split using a comma as separator
-        print "{ \"src\": \"" macs[1] "\", \"dst\": \"" macs[2] "\", \"count\": " arr[key] " }";
-    }
-}'
+# One line per pair: frames, address A, address B - most frames first. With pipefail the
+# status is that of tshark, which says itself what is wrong with a file.
+set -o pipefail
+pairs="$(tshark -n -r "$FILE" -T fields -E occurrence=f -e eth.src -e eth.dst |
+  LC_ALL=C awk -v me="$ME" '
+    NF < 2 { skipped++; next }
+    { count[($1 "" < $2 "") ? $1 " " $2 : $2 " " $1]++ }
+    END {
+      for (k in count) print count[k], k
+      if (skipped) printf "%s: %d frame(s) without an Ethernet header not counted\n", me, skipped > "/dev/stderr"
+    }' |
+  LC_ALL=C sort -k1,1nr -k2,2 -k3,3)"
+status=$?
+if [ "$status" -ne 0 ]; then
+  [ -n "$pairs" ] || die "tshark could not read: $FILE"
+  echo "$ME: tshark stopped before the end of $FILE: the counts cover the part it could read" >&2
+  status=1
+fi
+[ -n "$TOP" ] && pairs="$(printf '%s\n' "$pairs" | head -n "$TOP")"
+
+if [ "$JSON" = 1 ]; then
+  printf '%s\n' "$pairs" | awk '
+    BEGIN { print "[" }
+    NF == 3 { printf "%s  { \"src\": \"%s\", \"dst\": \"%s\", \"count\": %d }", (n++ ? ",\n" : ""), $2, $3, $1 }
+    END { if (n) printf "\n"; print "]" }'
+elif [ -z "$pairs" ]; then
+  echo "$ME: no Ethernet frames in: $FILE" >&2
+else
+  printf '%s\n' "$pairs" | awk '
+    BEGIN { printf "%-17s  %-17s  %s\n", "ADDRESS A", "ADDRESS B", "FRAMES" }
+    { printf "%-17s  %-17s  %6d\n", $2, $3, $1 }'
+fi
+exit "$status"

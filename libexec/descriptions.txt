@@ -1,37 +1,37 @@
-btvpn	Connect to your company's Cisco VPN with one command (Keychain password, SMS code from Messages)
-change-filename	Rename DDMMYYYY.md files in a folder to YYYYMMDD.md
-copy-zsh-settings	Copy your zsh configuration to a remote Mac over ssh
-cp-dir-structure	Copy a directory tree without its files
-cp-dir-structure-w-files	Copy a directory, optionally adding an index.md
-create-outline-markdown	Turn the list items of a Markdown file into links to generated pages
-delete-old-models	Delete ollama models that were not modified for more than a week
-dns-flush	Flush the macOS DNS cache and restart the DNS service (asks for your Mac password)
-docker-cmdline	Print the entrypoint and command of a container
-docker-compose-start-services	Start the Docker Compose projects named on the command line
-docker-compose-stop-services-all	Stop every running Docker Compose project
-du	Save the size of each subdirectory, largest first, to a file
-eth-conv	Count the Ethernet conversations in a capture file (tshark)
-extract-time-info-w-tshark	First packet, last packet and duration of a capture file
-find-and-delete-duplicates	Find files with identical content and offer to delete the copies
-find-file	Find a file by name under a starting folder
-find-files-over-100m	List the files larger than 100 MB under a folder
-help	List these commands
-insert-date	Replace {{DATE}} in a file with today's date
-interface-test	Take the ens160 network interface down for 60 seconds, then up again (Linux)
-lima-podman-w-target	Start Lima with Podman from a sparsebundle on an external volume
-list-folders-with-pdf	List the folders that contain PDF files
-logger	Record this terminal session to a log file
-multivpn	Keep a second VPN connected next to the company one (openconnect + ocproxy)
-my-sync	Rsync a folder each time it changes (Linux, inotifywait)
-my-sync-fswatch	Pull a remote folder when it changes (fswatch over ssh; its author marked it "not working")
-nextra-setup	Scaffold a Nextra documentation project
-nextra-setup-w-podman	Scaffold a Nextra documentation project that runs with Podman
-print-route	Print one line of the routing table for the interface you name
-replace-heading	Rewrite "# DDMMYYYY" first-line headings of Markdown files as "# YYYYMMDD"
-run-docker-web	Build the mkdocs site in ~/git-repos/docker and serve it with nginx on a remote host
-run-docker-web3	Build the mkdocs site in ~/git-repos/docker-v3 and serve it with nginx on a remote host
-sdd	Serve the mkdocs site in ~/git-repos/docker
-srd	Start the Docker Compose stack in ~/git-repos/mydocs
-sslkeylog-capture	Browse with TLS keys logged while tshark captures the packets
-sync-git-msp	Rsync a local folder to a remote host (dry run, watch mode)
-sync-git-msp-v2	Rsync a local folder to a remote host (live progress, history, watch mode)
+btvpn	Connect to your company's Cisco VPN with one command (Keychain password, SMS code from Messages)	expect os:macos
+change-filename	Rename DDMMYYYY.md files under a folder to YYYYMMDD.md so that they sort by date
+copy-zsh-settings	Copy your zsh configuration to another machine over ssh, with a backup there	ssh rsync
+cp-dir-structure	Copy the folders of a tree to another place, without the files in them
+cp-dir-structure-w-files	Copy a folder tree with all its files or only matching ones, never overwriting a file
+create-outline-markdown	Turn the list items of a Markdown outline into links to stub pages it creates
+delete-old-models	Delete the ollama models pulled or changed at least N days ago, after listing them	ollama
+dns-flush	Flush the macOS DNS cache and restart the DNS service (asks for your Mac password)	os:macos
+docker-cmdline	Print the command line a container or image runs, quoted for pasting into a shell	docker
+docker-compose-start-services	Start Docker Compose projects by folder name under a base folder, or list them	docker
+docker-compose-stop-services-all	Stop or take down every running Docker Compose project, after listing and asking	docker
+du	Show the disk space used by a folder and the folders in it, largest first
+eth-conv	Count the frames between each pair of Ethernet addresses in a capture file	tshark
+extract-time-info-w-tshark	Show first and last packet time, duration and packet count of capture files	tshark
+find-and-delete-duplicates	Find files with identical content and delete all but one of each, asking first
+find-file	Find files and folders by name or part of a name under a folder, ignoring case
+find-files-over-100m	List the files over 100 MB (or another size) under a folder, largest first
+help	List these commands with one line each, or check which of them can run here
+insert-date	Replace the placeholder {{DATE}} in files with today's date
+interface-test	Take a network interface down for some seconds, then bring it up again (asks first)
+lima-podman-w-target	Start the Lima podman machine kept in a disk image on an external volume (macOS)	limactl podman os:macos
+list-folders-with-pdf	List the folders that contain PDF files, or files with another extension
+logger	Record the terminal session to a dated log file, or list the logs	script
+multivpn	Keep a second VPN connected next to the company one (openconnect + ocproxy)	openconnect ocproxy os:macos
+my-sync	Copy a folder to another place with rsync, now and again after every change	rsync
+my-sync-fswatch	Pull a folder from another machine with rsync, now and after every change there	ssh rsync
+nextra-setup	Create a Nextra 4 documentation site project in a new folder
+nextra-setup-w-podman	Create a Nextra 4 documentation site project with a Podman runner script
+print-route	Show the routing table in short form, or the route used to reach one destination
+replace-heading	Rewrite a first-line heading # DDMMYYYY as # YYYYMMDD in the Markdown files of a folder
+run-docker-web	Build a mkdocs site, copy it to a remote host and serve it there with nginx in Docker	mkdocs rsync ssh
+run-docker-web3	Publish a second mkdocs site (docker-v3) the same way, with its own folders	mkdocs rsync ssh
+sdd	Serve a mkdocs documentation project locally while you edit it	mkdocs
+srd	Start the Docker Compose project in a folder in the background, or stop it	docker
+sslkeylog-capture	Record a browser session as a packet capture plus the TLS keys that decrypt it	tshark
+sync-git-msp	Mirror a local folder to a folder on a remote host with rsync over ssh	rsync ssh
+sync-git-msp-v2	Mirror a local folder to a remote host with rsync, with progress and a history of runs	rsync ssh

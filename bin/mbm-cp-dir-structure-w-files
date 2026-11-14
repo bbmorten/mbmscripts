@@ -1,55 +1,185 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-cp-dir-structure-w-files - copy a folder tree with its files, or with only the files that match
+#
+# Usage:
+#   mbm-cp-dir-structure-w-files [-n] [-v] [-c] [-i PATTERN]... SRC DST
+#
+# Arguments:
+#   SRC   the folder to copy
+#   DST   the folder that receives it; it is made when missing. What is inside SRC goes
+#         inside DST: SRC/a/x.md becomes DST/a/x.md, whether or not DST exists already.
+#
+# Options:
+#   -i, --include PATTERN   copy only the files whose name matches PATTERN (quote it:
+#                           '*.md'); may be given several times. Every folder is still made.
+#   -c, --index             put an empty index.md into every copied folder that has none
+#   -n, --dry-run           list what would be made and copied; change nothing
+#   -v, --verbose           list every folder and file as it is made or copied
+#   -h, --help              show this help
+#
+# Examples:
+#   mbm-cp-dir-structure-w-files ~/Projects/site ~/Projects/site-copy
+#   mbm-cp-dir-structure-w-files -i '*.md' -i '*.png' docs docs-text-only
+#   mbm-cp-dir-structure-w-files -n -c -i '*.md' course-2024 course-2025
+#
+# A file that exists in DST is never overwritten. One with the same content counts as
+# there already; one that differs is listed as "kept" and makes the exit status 1.
+# Symbolic links are copied as links. DST may lie inside SRC: it is not copied into itself.
+# For the folders alone, use mbm-cp-dir-structure.
+#
+# Exit status: 0 done, 1 something could not be copied or a different file was kept,
+# 2 wrong usage.
 
-# Set default values for options
-do_task=false
-copy_files=false
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%cp-dir-structure-w-files}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-# Parse options and parameters
-while getopts ":tc" opt; do
-  case $opt in
-    t)
-      do_task=true
-      ;;
-    c)
-      copy_files=true
-      ;;
-    \?)
-      echo "Invalid option: -$OPTARG" >&2
-      exit 1
-      ;;
-    :)
-      echo "Option -$OPTARG requires an argument." >&2
-      exit 1
-      ;;
+DRY=0
+VERBOSE=0
+INDEX=0
+PATS=()
+ARGS=()   # what is not an option; options may stand anywhere before a "--"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -v|--verbose) VERBOSE=1 ;;
+    -c|--index) INDEX=1 ;;
+    -i|--include)
+      [ $# -ge 2 ] && [ -n "$2" ] || bad_usage "$1 needs a pattern"
+      PATS[${#PATS[@]}]="$2"
+      shift ;;
+    --) shift; while [ $# -gt 0 ]; do ARGS[${#ARGS[@]}]="$1"; shift; done; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) ARGS[${#ARGS[@]}]="$1" ;;
   esac
+  shift
 done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+[ $# -eq 2 ] || bad_usage "expected SRC and DST, got $# arguments"
+[ -n "$1" ] && [ -n "$2" ] || bad_usage "SRC and DST must not be empty"
+src="$1"
+dst="$2"
+while [ "$src" != / ] && [ "${src%/}" != "$src" ]; do src="${src%/}"; done
+while [ "$dst" != / ] && [ "${dst%/}" != "$dst" ]; do dst="${dst%/}"; done
 
-# Shift the option arguments so that we can access the remaining parameters
-shift $((OPTIND-1))
+[ -d "$src" ] || die "not a folder: $src"
+[ ! -e "$dst" ] || [ -d "$dst" ] || die "exists and is not a folder: $dst"
 
-# Check that there are exactly two parameters (source and destination)
-if [ $# -ne 2 ]; then
-    echo "Usage: $0 [-t] [-c] source destination"
-    exit 1
+# phys PATH - the physical absolute path of a folder that may not exist yet
+phys() {
+  local p="$1" rest="" base
+  case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+  while [ ! -d "$p" ]; do
+    rest="/${p##*/}$rest"
+    p="${p%/*}"
+    [ -n "$p" ] || p=/
+  done
+  base="$(cd -- "$p" && pwd -P)" || return 1
+  printf '%s%s\n' "${base%/}" "$rest"
+}
+
+# matches NAME - true when no -i was given, or NAME matches one of the patterns
+matches() {
+  local p
+  [ "${#PATS[@]}" -gt 0 ] || return 0
+  for p in "${PATS[@]}"; do
+    # shellcheck disable=SC2254  # $p is a pattern on purpose
+    case "$1" in $p) return 0 ;; esac
+  done
+  return 1
+}
+
+# same SRCFILE DSTFILE - true when the two hold the same thing
+same() {
+  if [ -L "$1" ] || [ -L "$2" ]; then
+    [ -L "$1" ] && [ -L "$2" ] && [ "$(readlink "$1")" = "$(readlink "$2")" ]
+  else
+    cmp -s -- "$1" "$2"
+  fi
+}
+
+# show TEXT - a line of the list (with --dry-run or --verbose)
+show() { [ "$DRY" = 0 ] && [ "$VERBOSE" = 0 ] || printf '%s\n' "$1"; }
+
+src_abs="$(cd -- "$src" && pwd -P)" || die "cannot enter $src"
+dst_abs="$(phys "$dst")" || die "cannot work out where $dst is"
+[ "${src_abs%/}" != "$dst_abs" ] || die "SRC and DST are the same folder"
+# When DST lies inside SRC: its path relative to SRC, to leave it out of the copy.
+inside=""
+case "$dst_abs" in "${src_abs%/}"/*) inside="./${dst_abs#"${src_abs%/}"/}" ;; esac
+
+list="$(mktemp)" || die "cannot make a temporary file"
+trap 'rm -f "$list"' EXIT
+failed=0
+# The list is complete before anything is made, and it holds paths relative to SRC;
+# find names a folder before what is in it.
+(cd -- "$src" && find . \( -type d -o -type f -o -type l \) -print0) > "$list" || failed=1
+
+folders=0 files=0 there=0 kept=0 indexes=0
+sdirs=()
+tdirs=()
+while IFS= read -r -d '' p; do
+  if [ -n "$inside" ]; then
+    case "$p" in "$inside"|"$inside"/*) continue ;; esac
+  fi
+  if [ "$p" = . ]; then s="$src"; t="$dst"; else s="${src%/}/${p#./}"; t="${dst%/}/${p#./}"; fi
+  if [ -d "$s" ] && [ ! -L "$s" ]; then
+    sdirs[${#sdirs[@]}]="$s"
+    tdirs[${#tdirs[@]}]="$t"
+    [ ! -d "$t" ] || continue
+    if [ "$DRY" = 1 ] || mkdir -p -- "$t"; then
+      folders=$((folders + 1))
+      show "folder  $t"
+    else
+      failed=1
+    fi
+    continue
+  fi
+  matches "${p##*/}" || continue
+  if [ -e "$t" ] || [ -L "$t" ]; then
+    if same "$s" "$t"; then
+      there=$((there + 1))
+    else
+      kept=$((kept + 1))
+      printf 'kept    %s (it exists and differs from %s)\n' "$t" "$s"
+    fi
+    continue
+  fi
+  if [ "$DRY" = 1 ] || cp -P -- "$s" "$t"; then
+    files=$((files + 1))
+    show "file    $t"
+  else
+    failed=1
+  fi
+done < "$list"
+
+if [ "$INDEX" = 1 ]; then
+  i=0
+  while [ "$i" -lt "${#tdirs[@]}" ]; do
+    s="${sdirs[$i]}/index.md"
+    t="${tdirs[$i]}/index.md"
+    i=$((i + 1))
+    [ ! -e "$t" ] && [ ! -L "$t" ] || continue
+    # In a dry run the copy has not happened: an index.md that SRC would bring is not made.
+    if [ "$DRY" = 1 ]; then
+      { [ -e "$s" ] || [ -L "$s" ]; } && matches index.md && continue
+    elif ! : > "$t"; then
+      failed=1
+      continue
+    fi
+    indexes=$((indexes + 1))
+    show "index   $t"
+  done
 fi
 
-# Set the source and destination directories
-source_dir=$1
-destination_dir=$2
-
-# Perform the task if the -t option was specified
-if [ "$do_task" = true ]; then
-    echo "Performing task on source directory $source_dir"
+if [ "$DRY" = 1 ]; then
+  echo "Dry run, nothing was changed. In $dst - folders to make: $folders, files to copy: $files, index.md to add: $indexes, files there already: $there, kept because they differ: $kept."
+else
+  echo "In $dst - folders made: $folders, files copied: $files, index.md added: $indexes, files there already: $there, kept because they differ: $kept."
 fi
-
-# Copy the source directory to the destination directory
-cp -r "$source_dir" "$destination_dir"
-
-# Perform additional actions if the -c option was specified
-if [ "$copy_files" = true ]; then
-    echo "Copying additional files to directory $destination_dir"
-    #cp /path/to/additional/files/* "$destination_dir"
-    touch "$destination_dir/index.md"
-fi
-
-echo "Done."
+[ "$failed" = 0 ] || die "some folders or files could not be read or copied (see the messages above)"
+[ "$kept" = 0 ] || die "files in $dst that differ from those in $src are never overwritten: $kept kept"

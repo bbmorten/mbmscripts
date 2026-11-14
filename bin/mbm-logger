@@ -1,8 +1,79 @@
-#!/bin/bash
-# mbm-logger
-# Log everything you do in Terminal.
+#!/usr/bin/env bash
+# mbm-logger - record this terminal session, everything it shows, to a dated log file
+#
+# Usage:
+#   mbm-logger [-d DIR]
+#   mbm-logger -l [-d DIR]
+#
+# Options:
+#   -d, --dir DIR   the folder for the logs; it is created when missing
+#                   (default: $MBM_LOGGER_DIR, else ~/Documents/Temp/TerminalLogs)
+#   -l, --list      list the logs in the folder, newest first, and exit
+#   -h, --help      show this help
+#
+# Starts a new shell under script(1). Until you leave that shell with "exit" or Ctrl-D,
+# the session is written to DIR/terminal_YYYY-MM-DD_HHMMSS.log. The log is readable only by
+# you. It is the raw terminal stream, colour codes included: read it with "less -R".
+# Inside a recording it refuses to start a second one.
+#
+# Examples:
+#   mbm-logger
+#   mbm-logger -d ~/logs
+#   mbm-logger -l
+#   less -R "$(mbm-logger -l | head -n 1)"
+#
+# Needs: script (part of macOS; on Linux it comes with util-linux). macOS and Linux.
+# Settings: MBM_LOGGER_DIR   the folder for the logs (default: ~/Documents/Temp/TerminalLogs)
 
-#* Formatted date & time string.
-FORMATTED_DATE=`/bin/date "+%Y-%m-%d%H%M%S"`
-/usr/bin/script  ~/Documents/Temp/TerminalLogs/terminal_$FORMATTED_DATE.log
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%logger}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
+DIR="${MBM_LOGGER_DIR:-$HOME/Documents/Temp/TerminalLogs}"
+LIST=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -d|--dir) [ $# -ge 2 ] || bad_usage "$1 needs a folder"; DIR="$2"; shift 2 ;;
+    -l|--list) LIST=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) bad_usage "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+[ $# -eq 0 ] || bad_usage "unexpected argument: $1"
+[ -n "$DIR" ] || bad_usage "the folder name is empty"
+case "$DIR" in -*) DIR="./$DIR" ;; esac   # script must not take the name for an option
+
+if [ "$LIST" = 1 ]; then
+  # The names sort by date, so the reverse of the name order is newest first. The C locale
+  # makes that order the same everywhere.
+  LC_ALL=C
+  logs=""
+  for f in "$DIR"/terminal_*.log; do
+    [ -f "$f" ] && logs="$f
+$logs"
+  done
+  [ -n "$logs" ] || { echo "$ME: no logs in $DIR" >&2; exit 0; }
+  printf '%s' "$logs"
+  exit 0
+fi
+
+command -v script >/dev/null 2>&1 || die "script is not installed (part of macOS; on Linux: util-linux, on Debian and Ubuntu the package bsdutils)"
+# BSD script puts the log's name in SCRIPT; the same is done below for the Linux one.
+[ -z "${SCRIPT:-}" ] || die "this shell is already being recorded to $SCRIPT - leave it with \"exit\" first"
+
+umask 077
+mkdir -p -- "$DIR" || die "cannot create the folder $DIR"
+FILE="$DIR/terminal_$(date +%Y-%m-%d_%H%M%S).log"
+[ ! -e "$FILE" ] || die "$FILE exists already - try again in a second"
+
+echo "$ME: recording this terminal to $FILE"
+echo "$ME: type \"exit\" (or press Ctrl-D) to end the recording"
+export SCRIPT="$FILE"
+# "script FILE" is the one form that the BSD script (macOS) and the util-linux script (Linux)
+# both take; their other options differ, so none is used.
+exec script "$FILE"

@@ -1,3 +1,65 @@
-#!/bin/zsh
-source $HOME/git-repos/docker/.venv/bin/activate
-cd ~/git-repos/docker && mkdocs serve
+#!/usr/bin/env bash
+# mbm-sdd - serve a mkdocs documentation project on this machine while you edit it
+#
+# Usage:
+#   mbm-sdd [DIR] [-- MKDOCS_ARGUMENTS...]
+#
+# Arguments:
+#   DIR                the project folder, the one that holds mkdocs.yml
+#                      (default: $MBM_SDD_DIR, else ~/git-repos/docker)
+#   MKDOCS_ARGUMENTS   everything after -- is handed to "mkdocs serve" unchanged
+#
+# Options:
+#   -h, --help         show this help
+#
+# Runs "mkdocs serve" in DIR and stays in the foreground; mkdocs prints the address, and
+# Ctrl-C stops it. When DIR holds a Python virtual environment in .venv, the mkdocs
+# installed there is used, otherwise the mkdocs on the PATH. Read the name as "serve docker
+# docs": it began as the shortcut for one project, which is still the default folder.
+#
+# Examples:
+#   mbm-sdd
+#   mbm-sdd ~/projects/handbook
+#   mbm-sdd ~/projects/handbook -- -a 127.0.0.1:8001
+#   mbm-sdd -- --strict
+#
+# Needs: mkdocs (pip install mkdocs), on the PATH or in DIR/.venv. macOS and Linux.
+# Settings: MBM_SDD_DIR   the project folder when no DIR is given (default: ~/git-repos/docker)
+
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%sdd}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+DIR=""
+given=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) bad_usage "unknown option: $1" ;;
+    *)
+      [ "$given" = 0 ] || bad_usage "more than one folder given: $1 (mkdocs arguments go after --)"
+      DIR="$1"; given=1; shift ;;
+  esac
+done
+# What is left in "$@" goes to mkdocs.
+
+[ "$given" = 1 ] || DIR="${MBM_SDD_DIR:-$HOME/git-repos/docker}"
+[ -d "$DIR" ] || die "no such folder: $DIR (name the project folder, or set MBM_SDD_DIR)"
+[ -f "$DIR/mkdocs.yml" ] || [ -f "$DIR/mkdocs.yaml" ] || die "no mkdocs.yml in $DIR - that is not a mkdocs project"
+cd -- "$DIR" || die "cannot enter $DIR"
+
+# The project's own virtual environment first, as "source .venv/bin/activate" would do.
+if [ -d .venv/bin ]; then
+  VIRTUAL_ENV="$PWD/.venv"
+  PATH="$VIRTUAL_ENV/bin:$PATH"
+  export VIRTUAL_ENV PATH
+  unset PYTHONHOME
+fi
+command -v mkdocs >/dev/null 2>&1 || die "mkdocs is not installed (pip install mkdocs, or install it into $DIR/.venv)"
+
+echo "$ME: serving $PWD with $(command -v mkdocs) - Ctrl-C stops it"
+exec mkdocs serve "$@"

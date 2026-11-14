@@ -1,23 +1,118 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-docker-compose-start-services - start Docker Compose projects by folder name, in the background
+#
+# Usage:
+#   mbm-docker-compose-start-services [-b BASE_DIR] [-e ENGINE] [-n] PROJECT...
+#   mbm-docker-compose-start-services [-b BASE_DIR] -l
+#
+# Arguments:
+#   PROJECT   the name of a folder under BASE_DIR, or a path to a folder (anything with a
+#             slash, or "."). The folder must hold compose.yaml, compose.yml,
+#             docker-compose.yaml or docker-compose.yml.
+#
+# Options:
+#   -b BASE_DIR, --base-dir BASE_DIR
+#                                the folder that holds the project folders (default: ~/git-repos)
+#   -l, --list                   list the projects found under BASE_DIR, one name per line
+#   -e ENGINE, --engine ENGINE   the program to run, for example podman (default: docker)
+#   -n, --dry-run                print the commands; start nothing
+#   -h, --help                   show this help
+#
+# Each project is started the way you would by hand: "docker compose up -d", run inside its
+# folder. A project that is missing or fails does not stop the others; they are named at the end.
+#
+# Examples:
+#   mbm-docker-compose-start-services blog wiki
+#   mbm-docker-compose-start-services -l
+#   mbm-docker-compose-start-services -n -b ~/work blog
+#   mbm-docker-compose-start-services ./checkout/blog
+#
+# Exit status: 0 every project was started; 1 a project was missing or did not start;
+# 2 called wrongly.
+# Needs: docker with the compose plugin (https://docs.docker.com/get-docker/).
+# Settings: MBM_COMPOSE_BASE_DIR   the base folder when -b is not given (default: ~/git-repos)
+#           MBM_CONTAINER_ENGINE   the engine when -e is not given (default: docker)
 
-# Define the base directory where your Docker Compose project folders are stored
-BASE_DIR=~/git-repos
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%docker-compose-start-services}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-# Loop through each project name passed as an argument to the script
-for project in "$@"; do
-  project_dir="$BASE_DIR/$project"
+BASE="${MBM_COMPOSE_BASE_DIR:-$HOME/git-repos}"
+ENGINE="${MBM_CONTAINER_ENGINE:-docker}"
+DRY=0
+LIST=0
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -l|--list) LIST=1 ;;
+    -b|--base-dir) [ $# -ge 2 ] || bad_usage "$1 needs a value"; BASE="$2"; shift ;;
+    --base-dir=*) BASE="${1#*=}" ;;
+    -e|--engine) [ $# -ge 2 ] || bad_usage "$1 needs a value"; ENGINE="$2"; shift ;;
+    --engine=*) ENGINE="${1#*=}" ;;
+    --) shift; ARGS+=("$@"); break ;;
+    -*) bad_usage "unknown option $1" ;;
+    *) ARGS+=("$1") ;;
+  esac
+  shift
+done
+[ -n "$BASE" ] || bad_usage "the base folder is empty"
+[ -n "$ENGINE" ] || bad_usage "the engine name is empty"
 
-  # Check if the project directory exists
-  if [ -d "$project_dir" ]; then
-    # Check if a docker-compose.yml file exists in the project directory
-    if [ -f "$project_dir/docker-compose.yml" ]; then
-      echo "Starting project $project..."
-      # Run the docker compose up command in detached mode to start the project in the background
-      docker compose -f "$project_dir/docker-compose.yml" up -d
-    else
-      echo "Warning: No docker-compose.yml file found in $project_dir."
-    fi
+# compose_file DIR - true when DIR holds a compose file (the four names Compose looks for).
+compose_file() {
+  local f
+  for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    [ -f "$1/$f" ] && return 0
+  done
+  return 1
+}
+
+if [ "$LIST" = 1 ]; then
+  [ "${#ARGS[@]}" -eq 0 ] || bad_usage "-l takes no project"
+  [ -d "$BASE" ] || die "no such folder: $BASE (name the base folder with -b or MBM_COMPOSE_BASE_DIR)"
+  found=0
+  for d in "$BASE"/*/; do
+    d="${d%/}"
+    compose_file "$d" || continue
+    printf '%s\n' "${d##*/}"
+    found=1
+  done
+  [ "$found" = 1 ] || echo "$ME: no folder with a compose file under $BASE" >&2
+  exit 0
+fi
+
+[ "${#ARGS[@]}" -gt 0 ] || bad_usage "no project given"
+if [ "$DRY" = 0 ]; then
+  command -v "$ENGINE" >/dev/null 2>&1 ||
+    die "$ENGINE is not installed (Docker: https://docs.docker.com/get-docker/; another engine: -e NAME)"
+fi
+
+missing=""
+for project in "${ARGS[@]}"; do
+  case "$project" in
+    */*|.|..) dir="$project" ;;
+    *) dir="$BASE/$project" ;;
+  esac
+  if [ ! -d "$dir" ]; then
+    echo "$ME: $project: no such folder: $dir" >&2
+    missing="$missing $project"
+  elif ! compose_file "$dir"; then
+    echo "$ME: $project: no compose file (compose.yaml, docker-compose.yml, ...) in $dir" >&2
+    missing="$missing $project"
+  elif [ "$DRY" = 1 ]; then
+    printf '(cd %q && %q compose up -d)\n' "$dir" "$ENGINE"
   else
-    echo "Warning: Directory $project_dir does not exist."
+    echo "Starting project $project ($dir)"
+    if ! (CDPATH="" cd -- "$dir" && "$ENGINE" compose up -d); then
+      echo "$ME: $project: \"$ENGINE compose up -d\" failed" >&2
+      missing="$missing $project"
+    fi
   fi
 done
+[ -z "$missing" ] || die "not started:$missing"
+exit 0

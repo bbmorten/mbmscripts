@@ -1,3 +1,95 @@
-#!/bin/zsh
-source $HOME/git-repos/mydocs/.venv/bin/activate
-cd ~/git-repos/mydocs && docker compose up -d
+#!/usr/bin/env bash
+# mbm-srd - start the Docker Compose project in a folder in the background, or stop it
+#
+# Usage:
+#   mbm-srd [-n] [DIR]
+#   mbm-srd -d [-n] [-y] [DIR]
+#
+# Arguments:
+#   DIR             the folder that holds the compose file
+#                   (default: $MBM_SRD_DIR, else ~/git-repos/mydocs)
+#
+# Options:
+#   -d, --down      stop the project and remove its containers ("docker compose down")
+#   -n, --dry-run   show the docker commands that would run; change nothing
+#   -y, --yes       with --down: do not ask first
+#   -h, --help      show this help
+#
+# Without -d it runs "docker compose up -d" in DIR and then lists the services with
+# "docker compose ps". With -d it asks, then runs "docker compose down": the containers and
+# the project's network go, named volumes stay. Read the name as "start the docs": it began
+# as the shortcut for one documentation stack, which is still the default folder.
+#
+# Examples:
+#   mbm-srd
+#   mbm-srd ~/projects/wiki
+#   mbm-srd -n ~/projects/wiki
+#   mbm-srd --down --yes ~/projects/wiki
+#
+# Needs: docker with the compose plugin (Docker Desktop, or https://docs.docker.com/engine/install/).
+#        macOS and Linux.
+# Settings: MBM_SRD_DIR   the folder when no DIR is given (default: ~/git-repos/mydocs)
+# Exit status: 0 done; 1 it could not be done, or you answered no; 2 wrong usage.
+
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%srd}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+confirm() {   # confirm "Stop it?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+DOWN=0; DRY=0; YES=0; DIR=""; given=0; opts=1
+while [ $# -gt 0 ]; do
+  if [ "$opts" = 1 ]; then
+    case "$1" in
+      -d|--down) DOWN=1; shift; continue ;;
+      -n|--dry-run) DRY=1; shift; continue ;;
+      -y|--yes) YES=1; shift; continue ;;
+      -h|--help) usage; exit 0 ;;
+      --) opts=0; shift; continue ;;
+      -*) bad_usage "unknown option: $1" ;;
+    esac
+  fi
+  [ "$given" = 0 ] || bad_usage "more than one folder given: $1"
+  DIR="$1"; given=1; shift
+done
+
+[ "$given" = 1 ] || DIR="${MBM_SRD_DIR:-$HOME/git-repos/mydocs}"
+[ -d "$DIR" ] || die "no such folder: $DIR (name the project folder, or set MBM_SRD_DIR)"
+cd -- "$DIR" || die "cannot enter $DIR"
+found=""
+for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
+  [ -f "$f" ] && { found="$f"; break; }
+done
+[ -n "$found" ] || die "no compose file in $DIR (compose.yaml, compose.yml, docker-compose.yml or docker-compose.yaml)"
+
+command -v docker >/dev/null 2>&1 || die "docker is not installed (Docker Desktop, or https://docs.docker.com/engine/install/)"
+docker compose version >/dev/null 2>&1 || die "this docker has no compose plugin (\"docker compose version\" fails)"
+
+if [ "$DOWN" = 1 ]; then
+  if [ "$DRY" = 1 ]; then
+    echo "Would run in $PWD:"
+    echo "  docker compose down"
+    exit 0
+  fi
+  confirm "Stop the Compose project in $PWD and remove its containers?" || die "nothing was stopped"
+  docker compose down || die "docker compose down failed in $PWD"
+else
+  if [ "$DRY" = 1 ]; then
+    echo "Would run in $PWD:"
+    echo "  docker compose up -d"
+    echo "  docker compose ps"
+    exit 0
+  fi
+  docker compose up -d || die "docker compose up failed in $PWD (is the Docker daemon running?)"
+  docker compose ps
+fi

@@ -1,16 +1,77 @@
-#!/bin/zsh
+#!/usr/bin/env bash
+# mbm-find-file - find files and folders by name, or by a part of the name, under a folder
+#
+# Usage:
+#   mbm-find-file [options] [START] PATTERN
+#
+# Arguments:
+#   START     the folder to search, with everything below it (default: the current folder)
+#   PATTERN   what the name must contain; upper and lower case count as the same.
+#             A PATTERN with a wildcard (* ? [) must match the whole name instead, as in
+#             '*.pdf'. Put it in quotes, or the shell expands it before it gets here.
+#
+# Options:
+#   -e, --exact   PATTERN is the whole name, in exactly this case (what `find -name` does)
+#   -f, --files   list files only
+#   -d, --dirs    list folders only
+#   -h, --help    show this help
+#   --            end of the options, for a START or PATTERN that starts with -
+#
+# Examples:
+#   mbm-find-file invoice                  every name under here that contains "invoice"
+#   mbm-find-file ~/Documents '*.pdf'      every PDF under ~/Documents
+#   mbm-find-file -f -e ~/src Makefile     only files called exactly "Makefile"
+#   mbm-find-file -d ~/src node_modules    only folders
+#
+# One path per line. Folders that may not be read are skipped without a message. A START
+# that is a symbolic link to a folder is followed; links below it are listed, not followed.
+#
+# Exit status: 0 something was found, 1 nothing was found or START is not a folder,
+# 2 wrong usage.
 
-# Check if the correct number of arguments is provided
-if [ "$#" -ne 2 ]; then
-    echo "Usage: $0 <starting-point> <filename>"
-    exit 1
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%find-file}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+EXACT=0
+TYPE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -e|--exact) EXACT=1 ;;
+    -f|--files) [ "$TYPE" = d ] && bad_usage "-f and -d exclude each other"; TYPE=f ;;
+    -d|--dirs) [ "$TYPE" = f ] && bad_usage "-f and -d exclude each other"; TYPE=d ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) break ;;
+  esac
+  shift
+done
+
+case $# in
+  0) bad_usage "no name to look for" ;;
+  1) START=.; PATTERN="$1" ;;
+  2) START="$1"; PATTERN="$2" ;;
+  *) bad_usage "too many arguments (a pattern with * or a space in it needs quotes)" ;;
+esac
+[ -n "$PATTERN" ] || bad_usage "the name to look for is empty"
+case "$PATTERN" in */*) bad_usage "PATTERN is a name, not a path: it cannot contain /" ;; esac
+[ -d "$START" ] || die "not a folder: $START (the folder comes first: $ME START PATTERN)"
+case "$START" in -*) START="./$START" ;; esac
+case "$START" in *[!/]*/) START="${START%"${START##*[!/]}"}" ;; esac   # Documents/ -> Documents
+
+if [ "$EXACT" = 1 ]; then
+  set -- -name "$PATTERN"
+else
+  case "$PATTERN" in *[*?[]*) ;; *) PATTERN="*$PATTERN*" ;; esac
+  set -- -iname "$PATTERN"
 fi
+[ -n "$TYPE" ] && set -- -type "$TYPE" "$@"
 
-# Assigning arguments to variables for better readability
-starting_point=$1
-filename=$2
-
-# Using find command to search for the file
-find "$starting_point" -name "$filename" 2>/dev/null
-
-
+# find runs in the user's own locale, so that -iname also folds letters such as S-cedilla.
+# awk passes the lines through and reports whether there were any.
+find -H "$START" "$@" 2>/dev/null | LC_ALL=C awk '{ print } END { exit NR == 0 }' ||
+  die "nothing under $START has a name that matches $PATTERN"

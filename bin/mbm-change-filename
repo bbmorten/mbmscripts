@@ -1,42 +1,100 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-change-filename - rename files called DDMMYYYY.md to YYYYMMDD.md, so that they sort by date
+#
+# Usage:
+#   mbm-change-filename [-n] [-e EXT] DIR
+#
+# Arguments:
+#   DIR   the folder to work in; the folders below it are included
+#
+# Options:
+#   -e, --ext EXT   the extension of the files to rename (default: md)
+#   -n, --dry-run   show the renames; rename nothing
+#   -h, --help      show this help
+#
+# Examples:
+#   mbm-change-filename ~/Notes/daily
+#   mbm-change-filename -n -e txt journal
+#
+# Only a name of exactly eight digits that is a real day, month and year is renamed:
+# 25122023.md becomes 20231225.md, while 31022024.md and 99999999.md are left alone.
+# The year must be 1900-2099, so a name that is YYYYMMDD already is never taken for
+# DDMMYYYY and a second run renames nothing. No file is ever overwritten: when the new
+# name is taken, the file is skipped and reported.
+# The matching "# DDMMYYYY" headings are converted by mbm-replace-heading.
+#
+# Exit status: 0 done, 1 DIR is not a folder, or a file was skipped or could not be
+# renamed, 2 wrong usage.
 
-# Function to rename the file
-rename_file() {
-    local old_file="$1"
-    local new_filename="$2"
-    
-    echo "Renaming $old_file to '$(dirname "$old_file")/$new_filename'"
-    mv "$old_file" "$(dirname "$old_file")/$new_filename"
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%change-filename}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+DRY=0
+EXT=md
+ARGS=()   # what is not an option; options may stand anywhere before a "--"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -e|--ext)
+      [ $# -ge 2 ] || bad_usage "$1 needs an extension"
+      EXT="${2#.}"
+      shift ;;
+    --) shift; while [ $# -gt 0 ]; do ARGS[${#ARGS[@]}]="$1"; shift; done; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) ARGS[${#ARGS[@]}]="$1" ;;
+  esac
+  shift
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+[ $# -eq 1 ] || bad_usage "expected one folder, got $# arguments"
+case "$EXT" in ''|*/*) bad_usage "not an extension: '$EXT'" ;; esac
+dir="$1"
+[ -d "$dir" ] || die "not a folder: $dir"
+case "$dir" in -*) dir="./$dir" ;; esac   # find would read it as an option
+
+# iso DDMMYYYY - print YYYYMMDD; false when the eight digits are not a date in 1900-2099
+iso() {
+  local d m y last
+  d=$((10#${1:0:2})) m=$((10#${1:2:2})) y=$((10#${1:4:4}))
+  [ "$y" -ge 1900 ] && [ "$y" -le 2099 ] && [ "$m" -ge 1 ] && [ "$m" -le 12 ] || return 1
+  case "$m" in
+    4|6|9|11) last=30 ;;
+    2) last=28
+       if [ $((y % 4)) -eq 0 ] && { [ $((y % 100)) -ne 0 ] || [ $((y % 400)) -eq 0 ]; }; then last=29; fi ;;
+    *) last=31 ;;
+  esac
+  [ "$d" -ge 1 ] && [ "$d" -le "$last" ] || return 1
+  printf '%s%s%s\n' "${1:4:4}" "${1:2:2}" "${1:0:2}"
 }
 
-# Ask for the directory if not provided as an argument
-if [ -z "$1" ]; then
-    read -p "Enter the directory path: " directory_path
-else
-    directory_path="$1"
-fi
+renamed=0 skipped=0 notdate=0 failed=0
+while IFS= read -r -d '' f; do
+  base="${f##*/}"
+  case "$base" in *."$EXT") ;; *) continue ;; esac
+  stem="${base%."$EXT"}"
+  case "$stem" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) ;; *) continue ;; esac
+  if ! new="$(iso "$stem")"; then
+    notdate=$((notdate + 1))
+    continue
+  fi
+  t="${f%/*}/$new.$EXT"
+  if [ -e "$t" ] || [ -L "$t" ]; then
+    echo "$ME: skipped $f: $t exists already" >&2
+    skipped=$((skipped + 1))
+  elif [ "$DRY" = 1 ] || mv -- "$f" "$t"; then
+    printf '%s -> %s\n' "$f" "$t"
+    renamed=$((renamed + 1))
+  else
+    failed=$((failed + 1))
+  fi
+done < <(find "${dir%/}/" -type f -name '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].*' -print0)
 
-# Check if the provided path is a valid directory
-if [ ! -d "$directory_path" ]; then
-    echo "Invalid directory path."
-    exit 1
-fi
-
-# Find all .md files in the directory
-find "$directory_path" -type f -name "*.md" | while read -r file; do
-    # Extract the filename without extension
-    filename=$(basename "$file" .md)
-    
-    # Check if the filename matches the date pattern
-    if [[ $filename =~ ^([0-9]{2})([0-9]{2})([0-9]{4})$ ]]; then
-        day="${BASH_REMATCH[1]}"
-        month="${BASH_REMATCH[2]}"
-        year="${BASH_REMATCH[3]}"
-        
-        # Construct the new filename
-        new_filename="${year}${month}${day}.md"
-        
-        # Rename the file
-        rename_file "$file" "$new_filename"
-    fi
-done
+if [ "$DRY" = 1 ]; then what="Would be renamed"; else what="Renamed"; fi
+echo "$what: $renamed; skipped because the new name is taken: $skipped; eight-digit names that are not DDMMYYYY dates: $notdate."
+[ "$failed" = 0 ] || die "could not be renamed: $failed (see the messages above)"
+[ "$skipped" = 0 ] || exit 1

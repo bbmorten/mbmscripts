@@ -1,29 +1,80 @@
-#!/bin/zsh
+#!/usr/bin/env bash
+# mbm-list-folders-with-pdf - list the folders that contain PDF files (or files of another type)
+#
+# Usage:
+#   mbm-list-folders-with-pdf [-e EXT] [-c] [DIR]
+#
+# Arguments:
+#   DIR   where to look, with everything below it (default: the current folder)
+#
+# Options:
+#   -e EXT, --ext EXT   look for files that end in .EXT instead of .pdf: docx, jpg,
+#                       tar.gz; written with or without the dot
+#   -c, --count         put the number of such files in front of each folder
+#   -h, --help          show this help
+#   --                  end of the options, for a DIR that starts with -
+#
+# Examples:
+#   mbm-list-folders-with-pdf ~/Documents
+#   mbm-list-folders-with-pdf -c                  the current folder, with the number of PDFs
+#   mbm-list-folders-with-pdf -e docx ~/Work      folders with Word documents
+#
+# One folder per line, sorted by name; with -c the number, a tab and the folder. Upper and
+# lower case in the extension count as the same, so REPORT.PDF is found. Hidden folders
+# are looked into as well. Folders that may not be read are skipped without a message.
+#
+# Exit status: 0 also when there is no such file (a note goes to standard error),
+# 1 DIR is not a folder, 2 wrong usage.
 
-# Check if a directory path is provided as an argument
-if [ -z "$1" ]; then
-    echo "Please provide a starting point directory as an argument."
-    exit 1
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%list-folders-with-pdf}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+EXT=pdf
+COUNT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -e|--ext) [ $# -ge 2 ] || bad_usage "$1 needs an extension"; EXT="$2"; shift ;;
+    -c|--count) COUNT=1 ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) break ;;
+  esac
+  shift
+done
+[ $# -le 1 ] || bad_usage "too many arguments: one folder at a time"
+DIR="${1:-.}"
+
+# Bytes, not the user's language: with a Turkish locale some programs do not take I for i,
+# and file names need not be valid text.
+export LC_ALL=C
+EXT="${EXT#.}"
+case "$EXT" in
+  ''|*[!A-Za-z0-9._+-]*) bad_usage "not a file extension: $EXT (write it like pdf or docx)" ;;
+esac
+[ -d "$DIR" ] || die "not a folder: $DIR"
+case "$DIR" in -*) DIR="./$DIR" ;; esac
+case "$DIR" in *[!/]*/) DIR="${DIR%"${DIR##*[!/]}"}" ;; esac   # Documents/ -> Documents
+
+# One line per matching file (a line break in a name becomes ?), cut down to its folder.
+list="$(
+  find -H "$DIR" ! -type d -iname "*.$EXT" -print0 2>/dev/null |
+    tr '\n\0' '?\n' |
+    sed -e 's|/[^/]*$||' -e 's|^$|/|' |
+    sort -f |
+    awk -v count="$COUNT" '
+      { if (!($0 in n)) order[++k] = $0; n[$0]++ }
+      END {
+        for (i = 1; i <= k; i++)
+          if (count) printf "%d\t%s\n", n[order[i]], order[i]; else print order[i]
+      }'
+)"
+if [ -n "$list" ]; then
+  printf '%s\n' "$list"
+else
+  echo "$ME: no .$EXT file under $DIR" >&2
 fi
-
-starting_dir="$1"
-
-# Search for PDF files recursively within the starting directory
-pdf_files=($starting_dir/**/*.pdf(N))
-
-# Extract the directory names from the file paths and remove duplicates
-folder_names=()
-for file in "${pdf_files[@]}"; do
-    folder=$(dirname "$file")
-    folder_names+=("$folder")
-done
-unique_folder_names=("${(@u)folder_names}")
-
-# Sort the folder names alphabetically
-sorted_folder_names=("${(@o)unique_folder_names}")
-
-# Print the folder names alphabetically
-echo "Folder names containing PDF files:"
-for folder in "${sorted_folder_names[@]}"; do
-    echo "$folder"
-done

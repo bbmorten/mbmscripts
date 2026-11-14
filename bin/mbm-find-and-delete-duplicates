@@ -1,52 +1,203 @@
-#!/bin/zsh
+#!/usr/bin/env bash
+# mbm-find-and-delete-duplicates - find files with identical content and delete all but one of each
+#
+# Usage:
+#   mbm-find-and-delete-duplicates [-r] [-n] [-y] [DIR]
+#
+# Arguments:
+#   DIR   the folder to check (default: the current folder)
+#
+# Options:
+#   -r, --recursive   also check the folders below DIR
+#   -n, --dry-run     only list the duplicates and what would be deleted; change nothing
+#   -y, --yes         delete without asking
+#   -h, --help        show this help
+#   --                end of the options, for a DIR that starts with -
+#   The letters can be written together: -rn is -r -n.
+#
+# Examples:
+#   mbm-find-and-delete-duplicates -n                 what is duplicated in the current folder
+#   mbm-find-and-delete-duplicates ~/Downloads        show each set, ask, then delete
+#   mbm-find-and-delete-duplicates -rn ~/Pictures     all folders below too; delete nothing
+#   mbm-find-and-delete-duplicates -r -y ~/Pictures   delete without asking
+#
+# Files are duplicates when they have the same size and the same SHA-256 checksum. Each
+# set is shown, the largest files first, and you are asked before anything in it is
+# deleted. Without a terminal nothing can be asked: add --yes or --dry-run. Just before
+# a file is deleted it is compared byte by byte with the one that stays.
+#
+# Which file stays: the one with the shortest path; among equally short paths the one
+# that sorts first, byte by byte. So "a.txt" stays and "a copy.txt" or "old/a.txt" goes.
+#
+# Never touched: empty files, symbolic links, everything inside a .git folder, and other
+# names of the file that stays (hard links). Look at a set before you say yes: a program
+# or a source tree may need the same file in two places.
+#
+# Needs: shasum or sha256sum (macOS and most Linux systems have one).
+# Exit status: 0 done, also when there was nothing to delete or you said no; 1 a file
+# could not be read or deleted, or there was no terminal to ask on; 2 wrong usage.
 
-# Usage: mbm-find-and-delete-duplicates [--recursive|-r]
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%find-and-delete-duplicates}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-if [[ "$1" == "--recursive" || "$1" == "-r" ]]; then
-  echo "Scanning for duplicate files by content (including subfolders)..."
-  find_cmd='find . -type f -print0'
-else
-  echo "Scanning for duplicate files by content (current directory only)..."
-  find_cmd='find . -maxdepth 1 -type f -print0'
+confirm() {   # confirm "Delete 3 files?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+REC=0
+DRY=0
+YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -r|--recursive) REC=1 ;;
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    --) shift; break ;;
+    -[rnyh][rnyh]*)   # letters written together: -rn is -r -n
+      rest="${1#-?}"; first="${1%"$rest"}"; shift
+      set -- "$first" "-$rest" "$@"; continue ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) break ;;
+  esac
+  shift
+done
+[ $# -le 1 ] || bad_usage "too many arguments: one folder at a time"
+DIR="${1:-.}"
+[ -d "$DIR" ] || die "not a folder: $DIR"
+case "$DIR" in -*) DIR="./$DIR" ;; esac
+case "$DIR" in *[!/]*/) DIR="${DIR%"${DIR##*[!/]}"}" ;; esac   # Documents/ -> Documents
+case "$(cd "$DIR" 2>/dev/null && pwd -P)/" in
+  */.git/*) die "$DIR is inside a .git folder: deleting there damages the repository" ;;
+esac
+if [ "$DRY" = 0 ] && [ "$YES" = 0 ] && [ ! -t 0 ]; then
+  die "nothing was checked: this is not a terminal, so I cannot ask before deleting. Add --dry-run to only list, or --yes to delete without asking."
 fi
 
-typeset -A hashfiles
+if command -v shasum >/dev/null 2>&1; then SHA=(shasum -a 256)
+elif command -v sha256sum >/dev/null 2>&1; then SHA=(sha256sum)
+else die "neither shasum nor sha256sum is installed (macOS has shasum; on Linux: install coreutils)"
+fi
+if stat -c %s / >/dev/null 2>&1; then STAT=(stat -c %s); else STAT=(stat -f %z); fi
 
-# Find files, compute hash, and store file lists (null-delimited)
-eval $find_cmd | while IFS= read -r -d '' file; do
-  hash=$(shasum -a 256 "$file" | awk '{print $1}')
-  hashfiles[$hash]+="$file"$'\0'
-done
+# Byte order and byte lengths, whatever the language: the rule for the file that stays
+# must give the same answer everywhere.
+export LC_ALL=C
+NL='
+'
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/duplicates.XXXXXX")" || die "cannot create a temporary folder"
+trap 'rm -rf "$tmp"' EXIT
 
-found=0
-for hash in ${(k)hashfiles}; do
-  files=()
-  while IFS= read -r -d '' f; do
-    files+=("$f")
-  done <<< "${hashfiles[$hash]}"
-  if (( ${#files} > 1 )); then
-    found=1
-    echo "\nDuplicate files (content hash: $hash):"
-    for f in $files; do
-      echo "  $f"
-    done
-    echo "Keep one and delete the rest? [y/N]"
-    read -q reply
-    echo
-    if [[ $reply == [yY] ]]; then
-      keep="${files[1]}"
-      for f in $files; do
-        if [[ "$f" != "$keep" && -e "$f" ]]; then
-          echo "Deleting $f"
-          rm "$f"
-        fi
-      done
-    else
-      echo "Skipping deletion for this group."
-    fi
+human() {   # human BYTES -> 1.4M
+  awk -v b="$1" 'BEGIN {
+    split("K M G T", unit, " "); i = 0
+    while (b >= 1024 && i < 4) { b /= 1024; i++ }
+    if (i == 0) print b "B"; else printf (b < 10 ? "%.1f%s\n" : "%.0f%s\n"), b, unit[i]
+  }'
+}
+lines() { wc -l < "$1" | tr -d ' '; }
+count() { if [ "$1" = 1 ]; then echo "1 $2"; else echo "$1 ${2}s"; fi; }   # count 2 file -> 2 files
+changed() { die "files changed while they were being compared; nothing more was deleted. Run it again."; }
+
+# 1. Every candidate: a regular, non-empty, readable file outside .git folders.
+depth=(-maxdepth 1)
+[ "$REC" = 1 ] && depth=(-mindepth 0)   # no limit; an empty array is an error in bash 3.2
+files=()
+n=0
+unread=0
+while IFS= read -r -d '' f; do
+  if [ -r "$f" ]; then files[n]="$f"; n=$((n + 1)); else unread=$((unread + 1)); fi
+done < <(find -H "$DIR" "${depth[@]}" -name .git -prune -o -type f -size +0 -print0)
+
+# 2. Sizes first: only files that share their size with another file are read at all.
+#    Then the checksum of those. One line per file comes back, in the order they went in
+#    (a name with a line break or a backslash in it gets a \ in front of its checksum).
+: > "$tmp/groups"
+if [ "$n" -gt 1 ]; then
+  printf '%s\0' "${files[@]}" | xargs -0 "${STAT[@]}" > "$tmp/sizes" 2>/dev/null
+  [ "$(lines "$tmp/sizes")" = "$n" ] || changed
+  awk 'NR == FNR { seen[$1]++; next } seen[$1] > 1 { print $1 "\t" FNR - 1 }' "$tmp/sizes" "$tmp/sizes" > "$tmp/same-size"
+  if [ -s "$tmp/same-size" ]; then
+    while IFS="$(printf '\t')" read -r _ i; do printf '%s\0' "${files[i]}"; done < "$tmp/same-size" |
+      xargs -0 "${SHA[@]}" 2>/dev/null |
+      awk '{ sum = $1; sub(/^\\/, "", sum); if (length(sum) == 64 && sum !~ /[^0-9a-f]/) print sum }' > "$tmp/sums"
+    [ "$(lines "$tmp/sums")" = "$(lines "$tmp/same-size")" ] || changed
+    # size, index, checksum: the largest files first, equal content together.
+    paste "$tmp/same-size" "$tmp/sums" | sort -t "$(printf '\t')" -k1,1nr -k3,3 -k2,2n > "$tmp/groups"
   fi
-done
-
-if (( ! $found )); then
-  echo "No duplicate files found."
 fi
+
+sets=0
+deleted=0
+freed=0
+failed=0
+set_files=()
+set_size=0
+set_key=""
+
+# 3. One set: the files in set_files have the same size and the same checksum.
+one_set() {
+  local keep f
+  local go=()
+  [ "${#set_files[@]}" -gt 1 ] || return 0
+  keep="${set_files[0]}"
+  for f in "${set_files[@]}"; do
+    if [ "${#f}" -lt "${#keep}" ] || { [ "${#f}" -eq "${#keep}" ] && [[ "$f" < "$keep" ]]; }; then keep="$f"; fi
+  done
+  for f in "${set_files[@]}"; do
+    [ "$f" = "$keep" ] && continue
+    [ "$f" -ef "$keep" ] && continue   # another name of the same file, not a copy
+    go[${#go[@]}]="$f"
+  done
+  [ "${#go[@]}" -gt 0 ] || return 0
+
+  sets=$((sets + 1))
+  echo
+  echo "$(( ${#go[@]} + 1 )) identical files, $(human "$set_size") each:"
+  printf '  keep    %s\n' "${keep//$NL/?}"
+  for f in "${go[@]}"; do printf '  delete  %s\n' "${f//$NL/?}"; done
+  if [ "$DRY" = 1 ]; then
+    deleted=$((deleted + ${#go[@]})); freed=$((freed + set_size * ${#go[@]}))
+    return 0
+  fi
+  confirm "Delete $(count "${#go[@]}" file)?" || { echo "Nothing deleted from this set."; return 0; }
+  for f in "${go[@]}"; do
+    if [ -f "$keep" ] && [ -f "$f" ] && [ ! -L "$f" ] && cmp -s -- "$keep" "$f" && rm -f -- "$f" && [ ! -e "$f" ]; then
+      deleted=$((deleted + 1)); freed=$((freed + set_size))
+    else
+      failed=$((failed + 1))
+      echo "$ME: not deleted (it changed since it was compared, or it cannot be removed): $f" >&2
+    fi
+  done
+}
+
+while IFS="$(printf '\t')" read -r size i sum <&3; do
+  if [ "$size $sum" != "$set_key" ]; then
+    one_set
+    set_files=(); set_key="$size $sum"; set_size="$size"
+  fi
+  set_files[${#set_files[@]}]="${files[i]}"
+done 3< "$tmp/groups"
+one_set
+
+[ "$sets" = 0 ] || echo
+if [ "$sets" = 0 ]; then
+  if [ "$REC" = 1 ]; then echo "No duplicate files found in: $DIR"
+  else echo "No duplicate files found in: $DIR (the folders in it were not checked; add -r for that)"
+  fi
+elif [ "$DRY" = 1 ]; then
+  echo "Dry run, nothing was deleted: $(count "$deleted" file) in $(count "$sets" set) could go, $(human "$freed") in all."
+else
+  echo "Deleted $(count "$deleted" file), $(human "$freed") in all."
+fi
+[ "$unread" = 0 ] || echo "$ME: $(count "$unread" file) could not be read and so not compared" >&2
+[ "$unread" = 0 ] && [ "$failed" = 0 ]

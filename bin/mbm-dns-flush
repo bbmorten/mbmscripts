@@ -1,22 +1,51 @@
-#!/bin/bash
-# mbm-dns-flush - flush the macOS DNS cache and restart the DNS service (mDNSResponder).
+#!/usr/bin/env bash
+# mbm-dns-flush - flush the macOS DNS cache and restart the DNS service (mDNSResponder)
+#
+# Usage:
+#   mbm-dns-flush
+#
+# Options:
+#   -h, --help   show this help
 #
 # Runs exactly:   sudo dscacheutil -flushcache; sudo killall mDNSResponder
 #
 # macOS asks for your Mac password (sudo). It starts the DNS service again by itself; the
-# command waits for that and shows the old and the new process number as proof.
+# command waits for that, up to 10 seconds, and shows the old and the new process number
+# as proof.
+#
+# Examples:
+#   mbm-dns-flush
+#
+# Exit status: 0 flushed and restarted, 1 a step failed or the service was not restarted
+# (the message says which), 2 called wrongly.
+#
+# Needs: macOS; dscacheutil, killall, pgrep and sudo are part of it.
 
 set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%dns-flush}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-ME="$(basename "$0")"
-case "${1:-}" in
-  -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" | sed "s/mbm-dns-flush/$ME/g"; exit 0 ;;
-esac
-[ "$(uname -s)" = "Darwin" ] || { echo "$ME: this command is for macOS" >&2; exit 1; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option $1" ;;
+    *) break ;;
+  esac
+done
+[ $# -eq 0 ] || bad_usage "it takes no arguments; got: $1"
+[ "$(uname -s)" = Darwin ] || die "this command is for macOS (on Linux with systemd: resolvectl flush-caches)"
 
 before="$(pgrep -x mDNSResponder | head -n 1)"
 
-sudo dscacheutil -flushcache; sudo killall mDNSResponder
+# Both steps run even when the first one fails, as in the one-line form above.
+failed=""
+sudo dscacheutil -flushcache || failed="sudo dscacheutil -flushcache"
+sudo killall mDNSResponder || failed="${failed:+$failed and }sudo killall mDNSResponder"
+[ -z "$failed" ] || die "this failed: $failed"
 
 # launchd restarts mDNSResponder; give it a few seconds.
 after=""
@@ -31,6 +60,5 @@ done
 if [ -n "$after" ] && [ "$after" != "$before" ]; then
   echo "DNS cache flushed and the DNS service restarted (mDNSResponder pid ${before:-none} -> $after)."
 else
-  echo "$ME: the DNS service was not restarted (mDNSResponder pid is still ${after:-none})." >&2
-  exit 1
+  die "the DNS service was not restarted within 10 seconds (mDNSResponder pid is still ${after:-none})"
 fi

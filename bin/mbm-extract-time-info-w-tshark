@@ -1,29 +1,104 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-extract-time-info-w-tshark - show when a capture file starts and ends, how long it lasts and how many packets it holds
+#
+# Usage:
+#   mbm-extract-time-info-w-tshark FILE...
+#
+# Arguments:
+#   FILE         a capture file that tshark can read (pcap, pcapng, ...)
+#
+# Options:
+#   -h, --help   show this help
+#
+# For each file it prints the earliest and the latest packet time (local time, and UTC in
+# brackets), the time between the two, and the number of packets. Of a file that was cut
+# short, the part that can be read is reported and the exit status is 1.
+#
+#   File:         capture.pcapng
+#   First packet: 2026-11-01 10:00:00.250000000 +0300  (2026-11-01 07:00:00.250000000 UTC)
+#   Last packet:  2026-11-02 11:30:05.750000000 +0300  (2026-11-02 08:30:05.750000000 UTC)
+#   Elapsed:      1d 01:30:05.500000000  (91805.500000000 seconds)
+#   Packets:      5
+#
+# Examples:
+#   mbm-extract-time-info-w-tshark capture.pcapng
+#   mbm-extract-time-info-w-tshark monday.pcap tuesday.pcap
+#   mbm-extract-time-info-w-tshark *.pcapng
+#
+# Needs: tshark (macOS: brew install wireshark; Linux: apt install tshark). macOS and Linux.
+# Exit status: 0 done, 1 a file could not be read to its end (the others are still
+#   reported), 2 wrong usage.
 
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <file.pcap>"
-    exit 1
-fi
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%extract-time-info-w-tshark}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-if [ ! -f "$1" ]; then
-    echo "Error: $1 is not a file."
-    exit 1
-fi
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) break ;;
+  esac
+done
+[ $# -ge 1 ] || bad_usage "no capture file given"
 
-# Replace with your capture file
-CAPTURE_FILE=$1
+command -v tshark >/dev/null 2>&1 || die "tshark is not installed (macOS: brew install wireshark; Linux: apt install tshark)"
 
-# Get first and last packet time
-FIRST_PACKET=$(tshark -r "$CAPTURE_FILE" -T fields -e frame.time -c 1)
-LAST_PACKET=$(tshark -r "$CAPTURE_FILE" -T fields -e frame.time -Y "frame.number==$(tshark -r "$CAPTURE_FILE" -T fields -e frame.number | tail -1)")
+# at SECONDS FORMAT [-u] - a time given in seconds since 1970 as text. GNU date takes
+# "-d @SECONDS", BSD date (macOS) "-r SECONDS".
+GNU_DATE=0
+date -d @0 +%s >/dev/null 2>&1 && GNU_DATE=1
+at() {
+  if [ "$GNU_DATE" = 1 ]; then date ${3:+"$3"} -d "@$1" "+$2"; else date ${3:+"$3"} -r "$1" "+$2"; fi
+}
 
-# Convert to seconds since epoch
-FIRST_EPOCH=$(date -j -f "%b %d, %Y %H:%M:%S" "$(echo $FIRST_PACKET | cut -d' ' -f1-5)" +%s)
-LAST_EPOCH=$(date -j -f "%b %d, %Y %H:%M:%S" "$(echo $LAST_PACKET | cut -d' ' -f1-5)" +%s)
+set -o pipefail
+status=0
+first=1
+for file in "$@"; do
+  [ -f "$file" ] || { echo "$ME: no such file: $file" >&2; status=1; continue; }
 
-# Calculate elapsed time
-ELAPSED=$(($LAST_EPOCH - $FIRST_EPOCH))
+  # One pass over the file. The answer is: packets, then seconds and nanoseconds of the
+  # earliest and of the latest time. The two parts are kept apart because a time with
+  # nanoseconds has more digits than awk's numbers hold exactly.
+  answer="$(tshark -n -r "$file" -T fields -e frame.time_epoch | LC_ALL=C awk '
+      { n++ }
+      NF == 0 { next }
+      {
+        split($1, part, ".")
+        s = part[1]
+        f = substr(part[2] "000000000", 1, 9)
+        if (!seen || s + 0 < s1 + 0 || (s + 0 == s1 + 0 && f < f1)) { s1 = s; f1 = f }
+        if (!seen || s + 0 > s2 + 0 || (s + 0 == s2 + 0 && f > f2)) { s2 = s; f2 = f }
+        seen = 1
+      }
+      END { if (seen) printf "%d %s %s %s %s\n", n, s1, f1, s2, f2; else print n + 0 }')"
+  failed=$?     # with pipefail: the status of tshark, which says itself what is wrong
+  read -r packets s1 f1 s2 f2 <<< "$answer"
+  if [ "$failed" -ne 0 ]; then
+    status=1
+    [ -n "${s1:-}" ] || { echo "$ME: tshark could not read: $file" >&2; continue; }
+    echo "$ME: tshark stopped before the end of $file: this is the part it could read" >&2
+  fi
 
-echo "First packet: $FIRST_PACKET"
-echo "Last packet: $LAST_PACKET"
-echo "Elapsed: $(date -u -r $ELAPSED +"%T")"
+  [ "$first" = 1 ] || echo
+  first=0
+  echo "File:         $file"
+  if [ -n "${s1:-}" ]; then
+    echo "First packet: $(at "$s1" "%Y-%m-%d %H:%M:%S.$f1 %z")  ($(at "$s1" "%Y-%m-%d %H:%M:%S.$f1 UTC" -u))"
+    echo "Last packet:  $(at "$s2" "%Y-%m-%d %H:%M:%S.$f2 %z")  ($(at "$s2" "%Y-%m-%d %H:%M:%S.$f2 UTC" -u))"
+    ns=$(( (s2 - s1) * 1000000000 + 10#$f2 - 10#$f1 ))
+    secs=$(( ns / 1000000000 ))
+    days=""
+    [ "$secs" -ge 86400 ] && days="$(( secs / 86400 ))d "
+    printf 'Elapsed:      %s%02d:%02d:%02d.%09d  (%d.%09d seconds)\n' "$days" \
+      $(( secs % 86400 / 3600 )) $(( secs % 3600 / 60 )) $(( secs % 60 )) $(( ns % 1000000000 )) \
+      "$secs" $(( ns % 1000000000 ))
+  fi
+  echo "Packets:      $packets"
+done
+exit "$status"

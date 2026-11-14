@@ -1,16 +1,155 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-interface-test - take a network interface down, wait, and bring it up again (a link outage on purpose)
+#
+# Usage:
+#   mbm-interface-test [-t SECONDS] [-n] [-y] IFACE
+#
+# Arguments:
+#   IFACE   the interface, for example eth0 or ens160.
+#           To list them: "ip -br link" on Linux, "ifconfig -l" on macOS.
+#
+# Options:
+#   -t SECONDS, --time SECONDS   how long the interface stays down (default: 60)
+#   -n, --dry-run                show the commands; change nothing
+#   -y, --yes                    do not ask before taking the interface down
+#   -h, --help                   show this help
+#
+# Every connection through IFACE is cut while it is down. The interface is brought up again
+# when the time is over, and at once when you press Ctrl-C, when the command is stopped
+# (kill) or when its terminal goes away.
+#
+# The work needs root. Started as another user, the command asks you first and then runs
+# itself again through sudo: the password is asked once, before anything is taken down, and
+# is not needed again to bring the interface back.
+#
+# Over ssh through IFACE itself: the session freezes while the interface is down and
+# normally continues afterwards. If the session is closed in between, the interface comes up
+# at that moment. A console, or a session over another interface, is still the better place.
+#
+# Examples:
+#   mbm-interface-test eth0
+#   mbm-interface-test -t 10 -y ens160
+#   mbm-interface-test -n en0
+#
+# Exit status: 0 the interface is up again, 1 it was not done or could not be brought up
+# (the message says which), 2 called wrongly; 130 after Ctrl-C (the interface is up again).
+#
+# Needs: sudo, unless you are root. Linux: ip (package iproute2) or ifconfig. macOS: ifconfig.
 
-# Shut down the ens160 interface
-echo "Shutting down ens160 interface..."
-sudo ifconfig ens160 down
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%interface-test}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+confirm() {   # confirm "Question?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
 
-# Wait for 60 seconds
-echo "Waiting for 60 seconds..."
-sleep 60
+SECS=60
+DRY=0
+YES=0
+IFACE=""
+NPOS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    -t|--time)
+      [ $# -ge 2 ] || bad_usage "$1 needs a number of seconds"
+      SECS="$2"; shift ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option $1" ;;
+    *) NPOS=$((NPOS + 1)); IFACE="$1" ;;
+  esac
+  shift
+done
+for _a in "$@"; do NPOS=$((NPOS + 1)); IFACE="$_a"; done
+[ "$NPOS" = 1 ] || bad_usage "name one interface"
+case "$SECS" in ''|*[!0-9]*|0*) bad_usage "the time is a whole number of seconds, 1 or more; got: $SECS" ;; esac
+case "$IFACE" in ''|-*|*[!A-Za-z0-9_.:@-]*) die "not an interface name: $IFACE" ;; esac
 
-# Open up the ens160 interface
-echo "Opening up ens160 interface..."
-sudo ifconfig ens160 up
+# SET ... down|up changes the interface; SHOW prints its state.
+case "$(uname -s)" in
+  Linux)
+    if command -v ip >/dev/null 2>&1; then
+      SET=(ip link set dev "$IFACE"); SHOW=(ip link show dev "$IFACE"); LIST="ip -br link"
+    elif command -v ifconfig >/dev/null 2>&1; then
+      SET=(ifconfig "$IFACE"); SHOW=(ifconfig "$IFACE"); LIST="ifconfig -a"
+    else
+      die "neither ip nor ifconfig is installed (install the iproute2 package)"
+    fi ;;
+  Darwin)
+    command -v ifconfig >/dev/null 2>&1 || die "ifconfig was not found (on macOS it is in /sbin; check your PATH)"
+    SET=(ifconfig "$IFACE"); SHOW=(ifconfig "$IFACE"); LIST="ifconfig -l" ;;
+  *) die "works on Linux and macOS, not on $(uname -s)" ;;
+esac
 
-echo "Done."
+state="$("${SHOW[@]}" 2>/dev/null)" || die "no such interface: $IFACE (to list them: $LIST)"
+case "$state" in
+  *[\<,\ ]UP[,\>\ ]*) ;;   # <UP,BROADCAST,...> or <...,UP,LOWER_UP>; an old ifconfig prints " UP "
+  *) die "$IFACE is down already; there is nothing to test (to bring it up: ${SET[*]} up)" ;;
+esac
 
+AS_ROOT=1
+[ "$(id -u)" = 0 ] || AS_ROOT=0
+if [ "$DRY" = 1 ]; then
+  sudo=""
+  [ "$AS_ROOT" = 1 ] || sudo="sudo "
+  echo "Would run:"
+  printf '  %s\n' "$sudo${SET[*]} down" "sleep $SECS" "$sudo${SET[*]} up"
+  exit 0
+fi
+
+confirm "Take $IFACE down for $SECS seconds? Every connection through it is cut." \
+  || die "nothing done"
+
+if [ "$AS_ROOT" = 0 ]; then
+  command -v sudo >/dev/null 2>&1 || die "this needs root, and sudo is not installed: run it as root"
+  # sudo names the command it started in SUDO_COMMAND: never ask it twice for the same job.
+  case "${SUDO_COMMAND:-}" in
+    *" --yes --time $SECS -- $IFACE") die "sudo did not make this root: run it as root" ;;
+  esac
+  case "$SELF" in */*) ;; *) SELF="./$SELF" ;; esac
+  # One sudo for the whole job, so that bringing the interface back never waits for a
+  # password. "-u root" even where sudo is set up to switch to another user by default.
+  exec sudo -u root -- "$SELF" --yes --time "$SECS" -- "$IFACE"
+fi
+
+# From here on every way out goes through restore.
+WAIT_PID=""
+# shellcheck disable=SC2329  # restore is called by the EXIT trap
+restore() {
+  trap - EXIT
+  trap '' INT TERM HUP PIPE
+  [ -n "$WAIT_PID" ] && kill "$WAIT_PID" 2>/dev/null
+  if "${SET[@]}" up; then
+    echo "$IFACE is up again."
+  else
+    echo "$ME: could not bring $IFACE up again. Run: ${SET[*]} up" >&2
+    exit 1
+  fi
+}
+trap restore EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 141' PIPE
+
+if ! "${SET[@]}" down; then
+  trap - EXIT
+  die "could not take $IFACE down"
+fi
+echo "$IFACE is down for $SECS seconds. Ctrl-C brings it up at once."
+# In the background, so that a signal is acted on at once and not when sleep ends.
+sleep "$SECS" &
+WAIT_PID=$!
+wait "$WAIT_PID"
+WAIT_PID=""
+exit 0

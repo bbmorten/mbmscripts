@@ -1,20 +1,128 @@
-#!/bin/zsh
+#!/usr/bin/env bash
+# mbm-my-sync-fswatch - pull a folder from another machine with rsync, now and again after every change there
+#
+# Usage:
+#   mbm-my-sync-fswatch [options] USER HOST REMOTE_FOLDER
+#
+# Arguments:
+#   USER HOST       the account and the machine to pull from, reached over ssh
+#   REMOTE_FOLDER   the folder there: a full path, or one relative to the home folder
+#                   of USER. As with rsync, "FOLDER" puts the folder itself into the
+#                   local folder and "FOLDER/" puts what is in it there.
+#
+# Options:
+#   -l, --local DIR   the local folder to copy into (default: the current folder)
+#   -D, --delete      also remove from the local folder what is not in REMOTE_FOLDER:
+#                     local files the other machine does not have are lost.
+#                     It asks first; look with -n before.
+#   -n, --dry-run     show what rsync would copy (and with -D remove), once; change nothing
+#   -y, --yes         with -D: do not ask
+#   -h, --help        show this help
+#
+# It pulls once at the start. Then it keeps one ssh connection open that watches the
+# folder on the other machine, and pulls again whenever something changes there;
+# changes that come close together are pulled in one go. Stop it with Ctrl-C.
+# This is mbm-my-sync the other way round.
+#
+# Examples:
+#   mbm-my-sync-fswatch deploy web1.example.com /var/log/myapp
+#   mbm-my-sync-fswatch -l ~/site-copy -n deploy web1.example.com site/
+#   mbm-my-sync-fswatch -l ~/site-copy -D deploy web1.example.com site/
+#
+# Needs: ssh and rsync here; on the other machine rsync and a file watcher, fswatch
+#        (macOS: brew install fswatch) or inotifywait (Linux: apt install
+#        inotify-tools); ssh access that does not ask for a password every time.
+#        The host key of the other machine is checked, as ssh always does.
+#        Whether rsync takes a REMOTE_FOLDER with a space in its name as it is written
+#        depends on its version; old ones want the space escaped.
+# Exit status: 0 stopped with Ctrl-C, or -n finished; 1 an error, also when the
+#        connection ends; 2 wrong usage.
 
-# Not working
-# Check that three arguments were passed
-if [ $# -ne 3 ]; then
-  echo "Usage: $0 [remote user] [remote host] [remote folder]"
-  exit 1
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%my-sync-fswatch}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+confirm() {   # confirm "Delete 3 files?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+LOCAL="."
+DELETE=0
+DRY=0
+YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -l|--local) [ $# -ge 2 ] || bad_usage "$1 needs a folder"; LOCAL="$2"; shift ;;
+    -D|--delete) DELETE=1 ;;
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) break ;;
+  esac
+  shift
+done
+[ $# -eq 3 ] || bad_usage "give USER HOST REMOTE_FOLDER"
+case "$1" in ''|-*) bad_usage "not a user name: '$1'" ;; esac
+[ -n "$2" ] || bad_usage "HOST is empty"
+[ -n "$3" ] || bad_usage "REMOTE_FOLDER is empty"
+REMOTE="$1@$2"
+FOLDER="$3"
+# rsync and the watcher would read a name that starts with a dash as an option.
+case "$FOLDER" in -*) FOLDER="./$FOLDER" ;; esac
+case "$LOCAL" in -*) LOCAL="./$LOCAL" ;; esac
+[ -d "$LOCAL" ] || die "no such folder: $LOCAL"
+LOCAL="${LOCAL%/}/"
+command -v rsync >/dev/null 2>&1 || die "rsync is not installed (Linux: apt install rsync)"
+command -v ssh >/dev/null 2>&1 || die "ssh is not installed (Linux: apt install openssh-client)"
+
+RSYNC=(rsync -avz)
+[ "$DELETE" = 1 ] && RSYNC+=(--delete)
+if [ "$DRY" = 1 ]; then
+  "${RSYNC[@]}" --dry-run "$REMOTE:$FOLDER" "$LOCAL" || die "rsync failed"
+  exit 0
+fi
+if [ "$DELETE" = 1 ]; then
+  confirm "Remove from $LOCAL everything that is not in $REMOTE:$FOLDER?" || die "nothing was done"
 fi
 
-# Set variables for remote user, host, and folder
-REMOTE_USER="$1"
-REMOTE_HOST="$2"
-REMOTE_FOLDER="$3"
+"${RSYNC[@]}" "$REMOTE:$FOLDER" "$LOCAL" || die "rsync failed"
 
-# Use ssh to forward fswatch output to local machine and monitor remote folder
-ssh -N -T -L 1234:localhost:1234 "$REMOTE_USER@$REMOTE_HOST" "fswatch $REMOTE_FOLDER | socat - TCP:localhost:1234" |
-  while read path; do
-    echo "Change detected in remote folder '$REMOTE_FOLDER', syncing with local folder..."
-    rsync -avz -e 'ssh -p 22 -o StrictHostKeyChecking=no' "$REMOTE_USER@$REMOTE_HOST:$REMOTE_FOLDER" ./
-  done
+# What runs on the other machine: whichever watcher is there, printing one line per change.
+# A login over ssh does not always have Homebrew's folder on its PATH.
+q="'$(printf '%s' "$FOLDER" | sed "s/'/'\\\\''/g")'"
+watcher="PATH=\"\$PATH:/opt/homebrew/bin:/usr/local/bin\"
+if command -v fswatch >/dev/null 2>&1; then exec fswatch -o -r $q
+elif command -v inotifywait >/dev/null 2>&1; then exec inotifywait -m -r -q -e modify -e create -e delete -e move -e attrib $q
+else exit 44; fi"
+
+tmpd="$(mktemp -d)" || die "cannot create a temporary folder"
+wpid=""
+trap '[ -n "$wpid" ] && kill "$wpid" 2>/dev/null; rm -rf "$tmpd"' EXIT
+trap 'echo "$ME: stopped" >&2; exit 0' INT TERM
+mkfifo "$tmpd/changes" || die "cannot create a pipe in $tmpd"
+ssh -T -o ServerAliveInterval=30 "$REMOTE" "$watcher" > "$tmpd/changes" &
+wpid=$!
+exec 3< "$tmpd/changes"
+
+echo "$ME: watching $FOLDER on $REMOTE; stop with Ctrl-C" >&2
+while IFS= read -r _ <&3; do
+  while IFS= read -r -t 1 _ <&3; do :; done   # more changes: wait until it is quiet for a second
+  "${RSYNC[@]}" "$REMOTE:$FOLDER" "$LOCAL" || echo "$ME: rsync failed; it runs again after the next change" >&2
+done
+wait "$wpid"
+rc=$?
+wpid=""
+case "$rc" in
+  44) die "there is no file watcher on $2: install fswatch (macOS: brew install fswatch) or inotifywait (Linux: apt install inotify-tools) there" ;;
+  255) die "the connection to $2 ended; no longer watching" ;;
+  *) die "the watcher on $2 ended (exit $rc); no longer watching" ;;
+esac

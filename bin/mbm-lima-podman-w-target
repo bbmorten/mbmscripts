@@ -1,154 +1,149 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-lima-podman-w-target - start the Lima "podman" machine kept in a disk image on an external volume, and point podman at it
+#
+# Usage:
+#   mbm-lima-podman-w-target [-v VOLUME] [-e NAME] [-c SIZE] [--no-test] [-n]
+#
+# Options:
+#   -v VOLUME, --volume VOLUME   the volume that holds the image, /Volumes/VOLUME; a full
+#                                path to a folder works too (default: External)
+#   -e NAME, --name NAME         the image is NAME.sparsebundle (default: LimaData)
+#   -c SIZE, --create SIZE       when the image does not exist yet, create it with this
+#                                maximum size, for example 50g
+#       --no-test                do not run the test container at the end
+#   -n, --dry-run                print the commands; run nothing
+#   -h, --help                   show this help
+#
+# The steps. It stops at the first one that fails and says what to do:
+#   1. attach /Volumes/VOLUME/NAME.sparsebundle (already attached is fine)
+#   2. use the folder it is mounted on, normally /Volumes/NAME, as LIMA_HOME
+#   3. start the Lima machine "podman" there; when there is none yet, create it from
+#      Lima's podman template
+#   4. register the machine's socket as the podman connection "lima-podman" and make
+#      it the default
+#   5. run the container quay.io/podman/hello as a test (it is downloaded the first time)
+#   6. print the "export LIMA_HOME=..." line for your own shell
+#
+# A command cannot set a variable in the shell that called it. podman works at once,
+# through its default connection. limactl looks in ~/.lima until you run the printed
+# export line. To shut down: "limactl stop podman", then "hdiutil detach /Volumes/NAME".
+#
+# Examples:
+#   mbm-lima-podman-w-target
+#   mbm-lima-podman-w-target -n
+#   mbm-lima-podman-w-target -v MyDisk -e MyLimaData
+#   mbm-lima-podman-w-target -v MyDisk -c 50g
+#
+# Exit status: 0 the machine runs and podman reaches it; 1 a step failed; 2 called wrongly.
+# Needs: limactl (brew install lima), podman (brew install podman). macOS only (hdiutil).
+# Settings: MBM_LIMA_VOLUME     the volume when -v is not given (default: External)
+#           MBM_LIMA_TEMPLATE   the template for a new machine (default: template://podman)
 
-# Default values
-DEFAULT_SPARSEBUNDLE_NAME="LimaData"
-DEFAULT_VOLUME="${MBM_LIMA_VOLUME:-External}"
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%lima-podman-w-target}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-# Initialize variables with defaults
-SPARSEBUNDLE_NAME="$DEFAULT_SPARSEBUNDLE_NAME"
-VOLUME="$DEFAULT_VOLUME"
+MACHINE=podman
+CONNECTION=lima-podman
+TEST_IMAGE=quay.io/podman/hello
+TEMPLATE="${MBM_LIMA_TEMPLATE:-template://podman}"
+VOLUME="${MBM_LIMA_VOLUME:-External}"
+NAME=LimaData
+CREATE=""
+TEST=1
+DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    --no-test) TEST=0 ;;
+    -v|--volume) [ $# -ge 2 ] || bad_usage "$1 needs a value"; VOLUME="$2"; shift ;;
+    -e|--name) [ $# -ge 2 ] || bad_usage "$1 needs a value"; NAME="$2"; shift ;;
+    -c|--create) [ $# -ge 2 ] || bad_usage "$1 needs a value"; CREATE="$2"; shift ;;
+    --volume=*) VOLUME="${1#*=}" ;;
+    --name=*) NAME="${1#*=}" ;;
+    --create=*) CREATE="${1#*=}" ;;
+    -v?*) VOLUME="${1#-v}" ;;
+    -e?*) NAME="${1#-e}" ;;
+    --) shift; break ;;
+    -*) bad_usage "unknown option $1" ;;
+    *) break ;;
+  esac
+  shift
+done
+[ $# -eq 0 ] || bad_usage "unexpected argument: $1"
+[ -n "$VOLUME" ] || bad_usage "the volume name is empty"
+case "$NAME" in ''|*/*) bad_usage "NAME must be a plain name, without a slash: $NAME" ;; esac
+case "$CREATE" in -*) bad_usage "SIZE must look like 50g: $CREATE" ;; esac
 
-# Function to display usage
-usage() {
-    echo "Lima Podman Setup Script"
-    echo "========================"
-    echo ""
-    echo "This script sets up Lima with Podman by mounting a sparsebundle and configuring connections."
-    echo ""
-    echo "Usage: $0 [-e sparsebundle_name] [-v volume_name] [-h]"
-    echo ""
-    echo "Options:"
-    echo "  -e: Sparsebundle name (default: $DEFAULT_SPARSEBUNDLE_NAME)"
-    echo "  -v: Volume name where sparsebundle is located (default: $DEFAULT_VOLUME)"
-    echo "  -h: Display this help message"
-    echo ""
-    echo "Examples:"
-    echo "  # Use defaults ($DEFAULT_VOLUME volume, $DEFAULT_SPARSEBUNDLE_NAME sparsebundle)"
-    echo "  $0"
-    echo ""
-    echo "  # Use different volume where sparsebundle is stored"
-    echo "  $0 -v MyExternalDrive"
-    echo ""
-    echo "  # Use different sparsebundle name"
-    echo "  $0 -e MyLimaData"
-    echo ""
-    echo "  # Use both custom volume and sparsebundle name"
-    echo "  $0 -v MyExternalDrive -e MyLimaData"
-    echo ""
-    echo "  # This would look for: /Volumes/MyExternalDrive/MyLimaData.sparsebundle"
-    echo "  # And mount it as: /Volumes/MyLimaData"
-    echo ""
-    echo "What this script does:"
-    echo "  1. Attaches sparsebundle from /Volumes/{volume}/{sparsebundle}.sparsebundle"
-    echo "  2. Sets LIMA_HOME to /Volumes/{sparsebundle}"
-    echo "  3. Starts limactl podman"
-    echo "  4. Configures podman system connection"
-    echo "  5. Tests the setup with a hello container"
-    echo ""
-    exit 1
+[ "$(uname -s)" = Darwin ] || die "this command works on macOS only (it needs hdiutil and a sparsebundle disk image)"
+if [ "$DRY" = 0 ]; then
+  command -v hdiutil >/dev/null 2>&1 || die "hdiutil was not found; it is part of macOS"
+  command -v limactl >/dev/null 2>&1 || die "limactl is not installed (brew install lima)"
+  command -v podman >/dev/null 2>&1 || die "podman is not installed (brew install podman)"
+fi
+
+case "$VOLUME" in /*) DIR="${VOLUME%/}" ;; *) DIR="/Volumes/$VOLUME" ;; esac
+BUNDLE="$DIR/$NAME.sparsebundle"
+
+say() { printf '+'; printf ' %q' "$@"; echo; }   # print a command the way it can be typed
+step() {   # step "what to do when it fails" COMMAND [ARG...]
+  local hint="$1"
+  shift
+  say "$@"
+  [ "$DRY" = 1 ] && return 0
+  "$@" || die "this step failed: $1 ${2:-}. $hint"
 }
 
-# Parse command line options
-while getopts "e:v:h" opt; do
-    case $opt in
-        e)
-            SPARSEBUNDLE_NAME="$OPTARG"
-            ;;
-        v)
-            VOLUME="$OPTARG"
-            ;;
-        h)
-            usage
-            ;;
-        \?)
-            echo "Invalid option: -$OPTARG" >&2
-            usage
-            ;;
-        :)
-            echo "Option -$OPTARG requires an argument." >&2
-            usage
-            ;;
-    esac
-done
-
-# Construct paths
-SPARSEBUNDLE_PATH="/Volumes/$VOLUME/$SPARSEBUNDLE_NAME.sparsebundle"
-LIMA_HOME_PATH="/Volumes/$SPARSEBUNDLE_NAME"
-
-echo "Using volume: $VOLUME"
-echo "Using sparsebundle name: $SPARSEBUNDLE_NAME"
-echo "Full sparsebundle path: $SPARSEBUNDLE_PATH"
-echo "Lima home will be: $LIMA_HOME_PATH"
-
-# Check if sparsebundle exists
-if [ ! -e "$SPARSEBUNDLE_PATH" ]; then
-    echo "Error: Sparsebundle '$SPARSEBUNDLE_PATH' not found."
-    read -p "Enter the new path to create the sparsebundle: " NEW_SPARSEBUNDLE_PATH
-    
-    if [ -z "$NEW_SPARSEBUNDLE_PATH" ]; then
-        echo "Error: No path provided. Exiting."
-        exit 1
-    fi
-    
-    # Create the sparsebundle (you may need to adjust size and other parameters)
-    echo "Creating sparsebundle at: $NEW_SPARSEBUNDLE_PATH"
-    hdiutil create -size 50g -type SPARSEBUNDLE -fs "Case-sensitive APFS" -volname "$SPARSEBUNDLE_NAME" "$NEW_SPARSEBUNDLE_PATH"
-    
-    if [ $? -eq 0 ]; then
-        SPARSEBUNDLE_PATH="$NEW_SPARSEBUNDLE_PATH"
-        echo "Sparsebundle created successfully."
-    else
-        echo "Error: Failed to create sparsebundle. Exiting."
-        exit 1
-    fi
+# 1. The disk image.
+if [ ! -e "$BUNDLE" ]; then
+  [ -d "$DIR" ] || die "the volume is not mounted: there is no folder $DIR. Plug in the disk, or name the volume with -v."
+  [ -n "$CREATE" ] || die "there is no disk image $BUNDLE. Check -v and -e, or add \"-c 50g\" to create an empty one of at most 50 GB."
+  step "Is there room on $DIR, and may you write there?" \
+    hdiutil create -size "$CREATE" -type SPARSEBUNDLE -fs "Case-sensitive APFS" -volname "$NAME" "$BUNDLE"
+fi
+say hdiutil attach "$BUNDLE"
+MOUNT="/Volumes/$NAME"
+if [ "$DRY" = 0 ]; then
+  attached="$(hdiutil attach "$BUNDLE")" ||
+    die "could not attach $BUNDLE. If it is open on another Mac, detach it there; check it with: hdiutil verify $(printf '%q' "$BUNDLE")"
+  # hdiutil prints one line per device, with tabs; the mounted folder is the last field.
+  found="$(printf '%s\n' "$attached" | awk -F '\t' '{ for (i = 2; i <= NF; i++) if ($i ~ /^\//) m = $i } END { print m }')"
+  [ -n "$found" ] && MOUNT="$found"
+  [ -d "$MOUNT" ] || die "$BUNDLE is attached, but its volume is not at $MOUNT. Find it with: hdiutil info"
 fi
 
-# Attach the sparsebundle
-echo "Attaching sparsebundle..."
-hdiutil attach "$SPARSEBUNDLE_PATH"
-
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to attach sparsebundle. Exiting."
-    exit 1
-fi
-
-# Set LIMA_HOME environment variable
-export LIMA_HOME="$LIMA_HOME_PATH"
-echo "Set LIMA_HOME to: $LIMA_HOME"
-
-# Start limactl with podman
-echo "Starting limactl podman..."
-limactl start podman
-
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to start limactl podman. Exiting."
-    exit 1
-fi
-
-# Add podman system connection
-echo "Adding podman system connection..."
-podman system connection add lima-podman "unix://$LIMA_HOME_PATH/podman/sock/podman.sock"
-
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to add podman system connection. Exiting."
-    exit 1
-fi
-
-# Set default connection
-echo "Setting default podman connection..."
-podman system connection default lima-podman
-
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to set default podman connection. Exiting."
-    exit 1
-fi
-
-# Test the setup
-echo "Testing podman setup..."
-podman run quay.io/podman/hello
-
-if [ $? -eq 0 ]; then
-    echo "Setup completed successfully!"
+# 2. and 3. The Lima machine, kept inside the image.
+export LIMA_HOME="$MOUNT"
+SOCKET="$LIMA_HOME/$MACHINE/sock/podman.sock"
+say export LIMA_HOME="$LIMA_HOME"
+if [ "$DRY" = 1 ]; then
+  say limactl start "$MACHINE"
+  echo "#   when the machine does not exist yet: limactl start --name=$MACHINE --tty=false $TEMPLATE"
 else
-    echo "Warning: Test run failed. Please check the setup manually."
+  state="$(limactl list --format '{{.Status}}' "$MACHINE" 2>/dev/null)"
+  logs="Look at $LIMA_HOME/$MACHINE/ha.stderr.log. The image stays attached; to let it go: hdiutil detach $(printf '%q' "$MOUNT")"
+  case "$state" in
+    Running) echo "The Lima machine $MACHINE is already running." ;;
+    '') step "$logs" limactl start --name="$MACHINE" --tty=false "$TEMPLATE" ;;
+    *) step "$logs" limactl start "$MACHINE" ;;
+  esac
+  [ -e "$SOCKET" ] ||
+    die "the machine $MACHINE runs, but there is no podman socket at $SOCKET, so it was not made from Lima's podman template. If it holds nothing you need, delete it (LIMA_HOME=$(printf '%q' "$LIMA_HOME") limactl delete $MACHINE) and run $ME again."
 fi
+
+# 4. and 5. podman.
+step "See: podman system connection list" podman system connection add "$CONNECTION" "unix://$SOCKET"
+step "See: podman system connection list" podman system connection default "$CONNECTION"
+if [ "$TEST" = 1 ]; then
+  step "The machine runs and the connection is set, but the test container did not run. Is the network up? (--no-test skips this test.)" \
+    podman run --rm "$TEST_IMAGE"
+fi
+
+# 6. What the calling shell still needs.
+[ "$DRY" = 1 ] || echo "Ready: podman now uses the Lima machine $MACHINE in $LIMA_HOME."
+echo "For limactl, run this line in your own shell:"
+printf '  export LIMA_HOME=%q\n' "$LIMA_HOME"

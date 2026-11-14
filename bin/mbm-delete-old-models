@@ -1,58 +1,128 @@
-#!/bin/bash
-# mbm-delete-old-models
-# This script deletes ollama models that were modified more than 1 week ago.
+#!/usr/bin/env bash
+# mbm-delete-old-models - delete the ollama models that were pulled or changed at least a number of days ago
+#
+# Usage:
+#   mbm-delete-old-models [-d DAYS] [-n] [-y]
+#
+# Options:
+#   -d DAYS, --days DAYS   the age from which a model is deleted, in whole days (default: 7)
+#   -n, --dry-run          list the models that would be deleted; delete nothing
+#   -y, --yes              do not ask before deleting
+#   -h, --help             show this help
+#
+# The age is the MODIFIED column of "ollama list": when the model was pulled or last
+# changed on this machine. It is NOT when the model was last used, so a model you run
+# every day is deleted as well once its download is old enough.
+#
+# ollama rounds that column down ("2 weeks ago" is 14 to 20 days) and the low end is what
+# counts here, so no model is deleted before it is DAYS days old. A month counts as 30
+# days and a year as 365. A model whose age cannot be read is kept, with a warning.
+#
+# Examples:
+#   mbm-delete-old-models -n
+#   mbm-delete-old-models
+#   mbm-delete-old-models -d 30 -y
+#
+# Exit status: 0 done, or nothing was old enough; 1 ollama failed, or you answered no;
+# 2 called wrongly.
+# Needs: ollama (https://ollama.com/download), with its server running.
 
-# One week in seconds
-THRESHOLD=604800
-
-# Function to convert the modified time (value + unit) to seconds
-parse_time() {
-    local value=$1
-    local unit=$2
-    case "$unit" in
-        minute|minutes)
-            echo $(( value * 60 ))
-            ;;
-        hour|hours)
-            echo $(( value * 3600 ))
-            ;;
-        day|days)
-            echo $(( value * 86400 ))
-            ;;
-        month|months)
-            # Approximate a month as 30 days
-            echo $(( value * 30 * 86400 ))
-            ;;
-        year|years)
-            # Approximate a year as 365 days
-            echo $(( value * 365 * 86400 ))
-            ;;
-        *)
-            echo 0
-            ;;
-    esac
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%delete-old-models}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+confirm() {   # confirm "Delete 3 files?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
-# Get the list of models and skip the header line.
-# Each line is expected to have a format like:
-# NAME    ID    SIZE    <value> <unit> ago
-ollama list | tail -n +2 | while IFS= read -r line; do
-    # Extract the model name (first column)
-    name=$(echo "$line" | awk '{print $1}')
-    
-    # Extract the modified info from the end of the line.
-    # We assume the last three fields are: value, unit, and "ago".
-    modified_value=$(echo "$line" | awk '{print $(NF-2)}')
-    modified_unit=$(echo "$line" | awk '{print $(NF-1)}')
-    
-    # Convert the relative time to seconds.
-    seconds=$(parse_time "$modified_value" "$modified_unit")
-    
-    if (( seconds >= THRESHOLD )); then
-        echo "Deleting model: $name (modified $modified_value $modified_unit ago)"
-        ollama rm  "$name"
-    else
-        echo "Keeping model: $name (modified $modified_value $modified_unit ago)"
-    fi
+DAYS=7
+DRY=0
+YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    -d|--days) [ $# -ge 2 ] || bad_usage "$1 needs a value"; DAYS="$2"; shift ;;
+    --days=*) DAYS="${1#*=}" ;;
+    --) shift; break ;;
+    -*) bad_usage "unknown option $1" ;;
+    *) break ;;
+  esac
+  shift
 done
+[ $# -eq 0 ] || bad_usage "unexpected argument: $1"
+case "$DAYS" in
+  ''|*[!0-9]*|0*) bad_usage "DAYS must be a whole number, 1 or more: $DAYS" ;;
+esac
+[ "${#DAYS}" -le 6 ] || bad_usage "DAYS is too large: $DAYS"
+command -v ollama >/dev/null 2>&1 || die "ollama is not installed (https://ollama.com/download)"
 
+list="$(ollama list)" || die "could not list the models (is the ollama server running? start it with: ollama serve)"
+
+# One line per model: its age in days (or "?"), name, size and the MODIFIED text, with tabs
+# between them. The columns of "ollama list" are separated by two or more spaces.
+aged="$(printf '%s\n' "$list" | LC_ALL=C awk -F '[ \t][ \t]+' '
+  function age(m,   n, u) {
+    sub(/ ago$/, "", m)
+    if (m ~ /^Less than an? /) return 0
+    if (m ~ /^About an? [a-z]+$/) { n = 1; sub(/^About an? /, "", m) }
+    else if (m ~ /^[0-9]+ [a-z]+$/) { n = m + 0; sub(/^[0-9]+ /, "", m) }
+    else return "?"
+    u = m
+    sub(/s$/, "", u)
+    if (u == "second" || u == "minute") return 0
+    if (u == "hour") return int(n / 24)
+    if (u == "day") return n
+    if (u == "week") return n * 7
+    if (u == "month") return n * 30
+    if (u == "year") return n * 365
+    return "?"
+  }
+  NR > 1 {
+    sub(/[ \t]+$/, "")
+    if ($1 == "") next
+    printf "%s\t%s\t%s\t%s\n", age($NF), $1, (NF >= 4 ? $(NF - 1) : "?"), $NF
+  }')"
+
+names=()
+unit=days
+[ "$DAYS" = 1 ] && unit=day
+tab="$(printf '\t')"
+while IFS="$tab" read -r days name size modified; do
+  [ -n "$name" ] || continue
+  if [ "$days" = "?" ]; then
+    echo "$ME: kept $name: cannot read its age from \"$modified\"" >&2
+  elif [ "$days" -ge "$DAYS" ]; then
+    [ "${#names[@]}" -gt 0 ] || echo "Models pulled or changed at least $DAYS $unit ago:"
+    printf '  %-44s %-9s %s\n' "$name" "$size" "$modified"
+    names+=("$name")
+  fi
+done <<EOF_MODELS
+$aged
+EOF_MODELS
+
+count="${#names[@]}"
+if [ "$count" -eq 0 ]; then
+  echo "No model was pulled or changed $DAYS $unit ago or earlier. Nothing to delete."
+  exit 0
+fi
+if [ "$DRY" = 1 ]; then
+  echo "Dry run: nothing was deleted."
+  exit 0
+fi
+confirm "Delete every model listed above?" || die "cancelled; nothing was deleted"
+
+failed=""
+for name in "${names[@]}"; do
+  ollama rm "$name" || failed="$failed $name"
+done
+[ -z "$failed" ] || die "could not delete:$failed"
+exit 0

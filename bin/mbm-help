@@ -1,47 +1,112 @@
-#!/bin/bash
-# mbm-help - list the commands of this installation, each with one line about what it does.
+#!/usr/bin/env bash
+# mbm-help - list the commands of this collection with one line about each, or check which of them can run here
 #
-#   mbm-help            every command
-#   mbm-help WORD       only the commands whose name or description contains WORD
+# Usage:
+#   mbm-help [-c] [WORD]
+#
+# Arguments:
+#   WORD   only the commands whose name or description contains WORD (upper or lower case)
+#
+# Options:
+#   -c, --check   instead of the description, say whether each command can run on this
+#                 machine: "ok", or the programs it needs that are not installed and the
+#                 system it is for
+#   -h, --help    show this help
+#
+# Every command explains itself with --help, for example: mbm-du --help
+#
+# The list holds the commands in the folder this one was started from. Their descriptions
+# come from libexec/descriptions.txt next to the scripts, and for your own commands from
+# local/descriptions.txt. One command per line, the fields separated by tabs: the name
+# without its prefix, the description and, optionally, what the command needs - program
+# names separated by spaces, and os:macos or os:linux when it is for one system only.
+#
+# Examples:
+#   mbm-help
+#   mbm-help docker
+#   mbm-help --check
+#   mbm-help -c pdf
+#
+# Exit status: 0 listed, 1 no command matches WORD, 2 called wrongly.
 
 set -u
-
-# The real location of this file, through the symlink the installer made, and the name it
-# was called by (the installer may have given the commands another prefix than mbm-).
-ME="$(basename "$0")"
+ME="${0##*/}"
 SELF="$0"
-while [ -L "$SELF" ]; do
-  _dir="$(cd "$(dirname "$SELF")" && pwd)"
-  SELF="$(readlink "$SELF")"
-  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%help}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+CHECK=0
+WORD=""
+NPOS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -c|--check) CHECK=1 ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option $1" ;;
+    *) NPOS=$((NPOS + 1)); WORD="$1" ;;
+  esac
+  shift
 done
-SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
-ROOT="$(cd "$SELF_DIR/.." && pwd)"
+for _a in "$@"; do NPOS=$((NPOS + 1)); WORD="$_a"; done
+[ "$NPOS" -le 1 ] || bad_usage "one word at a time"
 
-case "${1:-}" in
-  -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" | sed "s/mbm-help/$ME/g"; exit 0 ;;
-esac
-
-# The folder the command was called from holds the commands under their installed names.
-BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+# The commands are in the folder this one was called from, under the prefix it was called
+# by. The descriptions are next to the real file, behind the link the installer made.
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PFX="${ME%help}"
-word="${1:-}"
+_s="$SELF"
+while [ -L "$_s" ]; do
+  _d="$(cd "$(dirname "$_s")" && pwd)"; _s="$(readlink "$_s")"
+  case "$_s" in /*) ;; *) _s="$_d/$_s" ;; esac
+done
+ROOT="$(cd "$(dirname "$_s")/.." && pwd)"
+LISTS=()
+for _f in "$ROOT/libexec/descriptions.txt" "$ROOT/local/descriptions.txt"; do
+  [ -r "$_f" ] && LISTS+=("$_f")
+done
+case "$(uname -s)" in Darwin) OS=macos ;; Linux) OS=linux ;; *) OS=other ;; esac
+TAB="$(printf '\t')"
 
-# name<TAB>description, names without the prefix. local/ holds your private commands.
-describe() {
-  awk -F '\t' -v k="$1" '$1 == k { print $2; found = 1; exit } END { if (!found) print "" }' \
-    "$ROOT/libexec/descriptions.txt" "$ROOT/local/descriptions.txt" 2>/dev/null | head -n 1
+# verdict NEEDS - "ok", or what stops a command that needs NEEDS from running here.
+verdict() {
+  local t toks miss="" systems="" here=0 out=""
+  read -r -a toks <<< "$1"
+  for t in ${toks[@]+"${toks[@]}"}; do
+    case "$t" in
+      os:*) systems="$systems ${t#os:}"; [ "${t#os:}" = "$OS" ] && here=1 ;;
+      *) command -v "$t" >/dev/null 2>&1 || miss="$miss $t" ;;
+    esac
+  done
+  [ -n "$systems" ] && [ "$here" = 0 ] && out="for$systems only"
+  [ -n "$miss" ] && out="${out:+$out; }missing:$miss"
+  echo "${out:-ok}"
 }
 
-for f in "$BIN_DIR"/"$PFX"*; do
-  [ -e "$f" ] || continue
-  name="$(basename "$f")"
-  desc="$(describe "${name#"$PFX"}")"
-  line="$(printf '%-40s %s' "$name" "$desc")"
-  if [ -n "$word" ]; then
-    printf '%s\n' "$line" | grep -i -F -- "$word"
-  else
-    printf '%s\n' "$line"
+# One line per command: name, description, and what the second column shows.
+for f in "$BIN_DIR/$PFX"*; do
+  name="${f##*/}"
+  if [ ! -f "$f" ]; then
+    # a link to a file that is gone is worth a line when checking
+    if [ -L "$f" ] && [ "$CHECK" = 1 ]; then printf '%s\t\t%s\n' "$name" "broken link"; fi
+    continue
   fi
-done
-exit 0
+  # description<TAB>needs of the first line for this name; nothing when there is none
+  rec="$(awk -F '\t' -v k="${name#"$PFX"}" '$1 == k { print $2 "\t" $3; exit }' /dev/null ${LISTS[@]+"${LISTS[@]}"})"
+  desc="${rec%%"$TAB"*}"
+  if [ "$CHECK" = 0 ]; then info="$desc"
+  elif [ ! -x "$f" ]; then info="not executable"
+  elif [ -z "$rec" ]; then info="unknown: no line for it in descriptions.txt"
+  else info="$(verdict "${rec#*"$TAB"}")"
+  fi
+  printf '%s\t%s\t%s\n' "$name" "$desc" "$info"
+done | LC_ALL=C awk -F '\t' -v w="$WORD" '
+  BEGIN { w = tolower(w) }
+  w == "" || index(tolower($1 " " $2), w) { n++; name[n] = $1; info[n] = $3; if (length($1) > width) width = length($1) }
+  END {
+    for (k = 1; k <= n; k++) if (info[k] == "") print name[k]; else printf "%-" width "s  %s\n", name[k], info[k]
+    exit (n == 0)
+  }' && exit 0
+if [ -n "$WORD" ]; then die "no command matches \"$WORD\""; fi
+die "no commands found in $BIN_DIR"

@@ -1,3 +1,198 @@
-#!/bin/bash
-netstat -rn | grep -E "^[0-9\.]+(/[0-9]+)?[[:space:]]+[0-9\.]+\.[0-9\.]+(\.[0-9\.]+){0,2}(/[0-9]+)?[[:space:]]+"$1 | awk '{print $1, $2, $3, $NF}' | sort -n -k2 | tail -n 1
+#!/usr/bin/env bash
+# mbm-print-route - show the routing table in short form, or the route the system would use to reach one destination
+#
+# Usage:
+#   mbm-print-route [-6] [-a] [-i IFACE]
+#   mbm-print-route [-6] DEST
+#
+# Arguments:
+#   DEST   an IP address or a host name. Prints the gateway and the interface the system
+#          would use to reach it, and the entry of the routing table that decided it.
+#
+# Options:
+#   -i IFACE, --interface IFACE   only the routes through this interface
+#   -a, --all                     macOS: also the per-host entries the system keeps for
+#                                 neighbours (ARP) and cloned routes; no effect on Linux
+#   -6, --ipv6                    IPv6 instead of IPv4 (chosen by itself for a DEST with a colon)
+#   -h, --help                    show this help
+#
+# Without DEST it prints one line per route: destination, gateway, interface, the default
+# routes first. Networks are written in full (10.0.0.0/8 where netstat on macOS prints
+# "10"), and a network that is reached without a gateway shows "direct".
+#
+# Examples:
+#   mbm-print-route
+#   mbm-print-route 8.8.8.8
+#   mbm-print-route example.com
+#   mbm-print-route -i en0
+#   mbm-print-route -6
+#
+# Exit status: 0 found, 1 no such route or the system tools are missing, 2 called wrongly.
+#
+# Needs: macOS (netstat and route, part of the system) or Linux (ip, package iproute2).
 
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%print-route}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+FAM=4
+ALL=0
+IFACE=""
+DEST=""
+NPOS=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -6|--ipv6) FAM=6 ;;
+    -a|--all) ALL=1 ;;
+    -i|--interface)
+      [ $# -ge 2 ] && [ -n "$2" ] || bad_usage "$1 needs an interface name"
+      IFACE="$2"; shift ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option $1" ;;
+    *) NPOS=$((NPOS + 1)); DEST="$1" ;;
+  esac
+  shift
+done
+for _a in "$@"; do NPOS=$((NPOS + 1)); DEST="$_a"; done
+[ "$NPOS" -le 1 ] || bad_usage "one destination at a time"
+if [ "$NPOS" = 1 ]; then
+  [ -n "$DEST" ] || bad_usage "the destination is empty"
+  [ -z "$IFACE" ] && [ "$ALL" = 0 ] || bad_usage "-i and -a list the table; they cannot be combined with a destination"
+  # Nothing that route or ip could read as one of their own keywords or options.
+  case "$DEST" in -*|*[!A-Za-z0-9.:_%-]*) die "not an address or a host name: $DEST" ;; esac
+  case "$DEST" in *:*) FAM=6 ;; esac
+fi
+
+OS="$(uname -s)"
+case "$OS" in
+  Darwin)
+    for _a in netstat route; do
+      command -v "$_a" >/dev/null 2>&1 || die "$_a was not found (on macOS it is in /usr/sbin or /sbin; check your PATH)"
+    done ;;
+  Linux) command -v ip >/dev/null 2>&1 || die "ip is not installed (install the iproute2 package)" ;;
+  *) die "works on macOS and Linux, not on $OS" ;;
+esac
+AF=inet
+[ "$FAM" = 6 ] && AF=inet6
+KINDS='unreachable|blackhole|prohibit|throw|local|broadcast|multicast|anycast|unicast'
+
+# rows - the routing table as "destination gateway interface", one route per line.
+rows() {
+  if [ "$OS" = Linux ]; then
+    # default via 192.168.1.1 dev eth0 proto dhcp metric 100
+    # 10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5
+    ip -o "-$FAM" route show | awk -v kinds="^($KINDS)\$" '
+      { d = $1; gw = "direct"; from = 2; found = 0
+        if ($1 ~ kinds) { d = $2; gw = $1; from = 3 }
+        for (c = from; c < NF; c++) {
+          if ($c == "via") gw = ($(c + 1) == "inet6") ? $(c + 2) : $(c + 1)
+          if ($c == "dev") { print d, gw, $(c + 1); found = 1 }
+        }
+        if (!found) print d, gw, "-"
+      }'
+  else
+    # Destination        Gateway            Flags               Netif Expire
+    # 10                 172.16.121.85      UGSc                utun9
+    netstat -rn -f "$AF" | awk -v all="$ALL" '
+      # netstat leaves out zero octets, and the prefix length when it is the old class
+      # default (A /8, B /16, C /24): write the network in full.
+      function full(d,   p, len, n, o) {
+        if (d !~ /^[0-9.]+(\/[0-9]+)?$/) return d
+        len = ""; p = index(d, "/")
+        if (p) { len = substr(d, p + 1); d = substr(d, 1, p - 1) }
+        n = split(d, o, ".")
+        if (len == "" && n == 4) return d
+        if (len == "") len = (o[1] < 128) ? 8 : (o[1] < 192) ? 16 : 24
+        while (n < 4) o[++n] = 0
+        return o[1] "." o[2] "." o[3] "." o[4] "/" len
+      }
+      $1 == "Destination" { for (c = 1; c <= NF; c++) { if ($c == "Flags") fc = c; if ($c == "Netif") nc = c }; next }
+      !nc || NF < nc { next }
+      !all && $fc ~ /[LW]/ { next }
+      { print full($1), ($2 ~ /^link#/ ? "direct" : $2), $nc }'
+  fi
+}
+
+# lookup - what the system would do with a packet for DEST.
+lookup() {
+  local raw="" out="" addr="$DEST" match="" why="the routing table has no entry for it"
+  if [ "$OS" = Linux ]; then
+    case "$DEST" in
+      *:*) ;;
+      *[!0-9.]*)   # a name: ip does not resolve it
+        addr="$(getent "ahostsv$FAM" "$DEST" 2>/dev/null | awk 'NR == 1 { print $1 }')" ;;
+    esac
+    if [ -z "$addr" ]; then
+      why="it is not an address or a known host name"
+    elif raw="$(ip -o "-$FAM" route get "$addr" 2>/dev/null)"; then
+      # The table entry that matched; an ip older than 2017 does not know fibmatch.
+      match="$(ip -o "-$FAM" route get fibmatch "$addr" 2>/dev/null |
+        awk -v kinds="^($KINDS)\$" 'NR == 1 { print ($1 ~ kinds) ? $2 : $1 }')"
+      # 8.8.8.8 via 192.168.1.1 dev eth0 src 192.168.1.10 uid 1000
+      out="$(printf '%s\n' "$raw" | awk -v kinds="^($KINDS)\$" -v m="$match" '
+        NR == 1 { to = ($1 ~ kinds) ? $2 : $1; gw = "direct"; dev = ""
+          for (c = 2; c < NF; c++) {
+            if ($c == "via") gw = ($(c + 1) == "inet6") ? $(c + 2) : $(c + 1)
+            if ($c == "dev") dev = $(c + 1)
+          }
+          if (dev == "") exit
+          printf "to         %s\n", to
+          if (m != "") printf "route      %s\n", m
+          printf "gateway    %s\ninterface  %s\n", gw, dev }')"
+    fi
+  else
+    if [ "$FAM" = 6 ]; then raw="$(route -n get -inet6 "$DEST" 2>&1)"; else raw="$(route -n get "$DEST" 2>&1)"; fi
+    case "$raw" in *"bad address"*|*"not known"*) why="it is not an address or a known host name" ;; esac
+    #    route to: 10.1.2.3
+    # destination: 10.0.0.0
+    #        mask: 255.0.0.0
+    #     gateway: 172.16.121.85
+    #   interface: utun9
+    out="$(printf '%s\n' "$raw" | awk '
+      function bits(m,   n, o, k, x, b) {
+        n = split(m, o, "."); b = 0
+        for (k = 1; k <= n; k++) for (x = o[k] + 0; x > 0; x = int(x / 2)) b += x % 2
+        return b
+      }
+      { p = index($0, ": "); if (!p) next
+        k = substr($0, 1, p - 1); sub(/^ +/, "", k); v[k] = substr($0, p + 2) }
+      END {
+        if (v["interface"] == "") exit
+        d = v["destination"]; m = v["mask"]; g = v["gateway"]
+        if (m ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) d = d "/" bits(m)
+        else if (m != "" && m != "default") d = d " mask " m
+        if (g == "" || g ~ /^link#/) g = "direct"
+        printf "to         %s\nroute      %s\ngateway    %s\ninterface  %s\n", v["route to"], d, g, v["interface"] }')"
+  fi
+  if [ -z "$out" ]; then
+    case "$DEST" in *[.:]*) ;; *) why="$why (for the routes through an interface: $ME -i $DEST)" ;; esac
+    die "no route to $DEST: $why"
+  fi
+  printf '%s\n' "$out"
+}
+
+if [ "$NPOS" = 1 ]; then
+  lookup
+  exit 0
+fi
+
+rows | awk -v want="$IFACE" '
+  want != "" && $3 != want { next }
+  { n++; dest[n] = $1; gw[n] = $2; dev[n] = $3
+    if (length($1) > wd) wd = length($1)
+    if (length($2) > wg) wg = length($2) }
+  END {
+    if (!n) exit 1
+    if (wd < 11) wd = 11
+    if (wg < 7) wg = 7
+    fmt = "%-" wd "s  %-" wg "s  %s\n"
+    printf fmt, "DESTINATION", "GATEWAY", "INTERFACE"
+    for (k = 1; k <= n; k++) if (dest[k] == "default") printf fmt, dest[k], gw[k], dev[k]
+    for (k = 1; k <= n; k++) if (dest[k] != "default") printf fmt, dest[k], gw[k], dev[k]
+  }' && exit 0
+if [ -n "$IFACE" ]; then die "no IPv$FAM route goes through $IFACE"; fi
+die "the IPv$FAM routing table is empty"

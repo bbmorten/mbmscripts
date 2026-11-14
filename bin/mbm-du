@@ -1,27 +1,72 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-du - show how much disk space a folder and the folders in it use, largest first
+#
+# Usage:
+#   mbm-du [-d DEPTH] [-o FILE] [DIR]
+#
+# Arguments:
+#   DIR   the folder to measure (default: the current folder)
+#
+# Options:
+#   -d DEPTH, --depth DEPTH   how many levels of folders to list below DIR (default: 1;
+#                             0 gives the total only)
+#   -o FILE, --output FILE    write the table to FILE instead of showing it
+#   -h, --help                show this help
+#   --                        end of the options, for a DIR that starts with -
+#
+# Examples:
+#   mbm-du                          the current folder and the folders in it
+#   mbm-du ~/Downloads
+#   mbm-du -d 2 ~/Projects          two levels deep
+#   mbm-du -o sizes.txt ~/Documents
+#
+# Each line is a size and a folder; the first line is the total for DIR. Sizes are what
+# `du -h` prints, in steps of 1024. When du cannot read a folder it says so itself, and
+# the sums are then too small.
+#
+# Exit status: 0 the table is complete, 1 DIR is not a folder, FILE cannot be written,
+# or du could not read everything, 2 wrong usage.
 
-# Check that a directory path was provided as an argument
-if [ $# -eq 0 ]; then
-  echo "Please provide a directory path as an argument"
-  exit 1
-fi
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%du}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-# Set the directory to the first argument
-dir="$1"
+DEPTH=1
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -d|--depth) [ $# -ge 2 ] || bad_usage "$1 needs a number"; DEPTH="$2"; shift ;;
+    -o|--output) [ $# -ge 2 ] || bad_usage "$1 needs a file name"; OUT="$2"; shift ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) break ;;
+  esac
+  shift
+done
+[ $# -le 1 ] || bad_usage "too many arguments: one folder at a time; to save the table use -o FILE"
+DIR="${1:-.}"
+case "$DEPTH" in
+  ''|*[!0-9]*) bad_usage "the depth must be a whole number, not: $DEPTH" ;;
+esac
+[ -d "$DIR" ] || die "not a folder: $DIR"
+case "$DIR" in -*) DIR="./$DIR" ;; esac
+case "$DIR" in *[!/]*/) DIR="${DIR%"${DIR##*[!/]}"}" ;; esac   # Documents/ -> Documents
 
-# Get the current timestamp in ISO format (YYYY-MM-DDTHH:MM:SS)
-timestamp=$(date +'%Y-%m-%dT%H:%M:%S')
+# LC_ALL=C: du writes 1.5M, not 1,5M, whatever the language, and sort -h reads that.
+# Equal sizes are sorted by name, which puts a folder before the folders in it.
+# -H: a DIR that is a symbolic link to a folder is measured, not the link.
+table="$(LC_ALL=C du -H -h -d "$DEPTH" -- "$DIR")"
+rc=$?
+table="$(printf '%s\n' "$table" | LC_ALL=C sort -t "$(printf '\t')" -k1,1hbr -k2)"
+[ -n "$table" ] || die "du gave no sizes for $DIR"
 
-# Set the output file name to the second argument, or use an automatic file name
-if [ $# -gt 1 ]; then
-  output_file="$2"
+if [ -n "$OUT" ]; then
+  { printf '%s\n' "$table" > "$OUT"; } 2>/dev/null || die "cannot write $OUT"
 else
-  output_file="directory_sizes_$timestamp.txt"
+  printf '%s\n' "$table"
 fi
-
-# Use the du command to get the size of each subdirectory, and sort the output
-du -hd 1 "$dir" | sort -hr > "$output_file"
-
-# Print a message indicating where the output was saved
-echo "Directory sizes saved to $output_file"
-
+[ "$rc" = 0 ] || die "du could not read everything under $DIR: the sums are too small"

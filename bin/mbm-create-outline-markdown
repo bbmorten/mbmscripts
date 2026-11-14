@@ -1,37 +1,196 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-create-outline-markdown - turn the list items of a Markdown outline into links to stub pages it creates
+#
+# Usage:
+#   mbm-create-outline-markdown [-n] [-y] [-d PAGES_DIR] [-p PREFIX] OUTLINE.md [OUTPUT.md]
+#   mbm-create-outline-markdown [-n] [-y] [-p PREFIX] DIR OUTLINE.md OUTPUT.md
+#
+# Arguments:
+#   OUTLINE.md   the outline to read; it is never changed
+#   OUTPUT.md    where the linked outline is written (default: standard output)
+#   DIR          the older form with three arguments: both files and the pages are in DIR
+#
+# Options:
+#   -d, --pages-dir PAGES_DIR   the folder for the stub pages (default: the folder of
+#                               OUTPUT.md, or of OUTLINE.md when there is no OUTPUT.md)
+#   -p, --prefix PREFIX         what the page names start with (default: gen_)
+#   -n, --dry-run               list the pages that would be created and print the linked
+#                               outline; write nothing
+#   -y, --yes                   overwrite an existing OUTPUT.md without asking
+#   -h, --help                  show this help
+#
+# Examples:
+#   mbm-create-outline-markdown course/outline.md course/index.md
+#   mbm-create-outline-markdown -n outline.md
+#   mbm-create-outline-markdown -p topic- -d docs outline.md > docs/index.md
+#   mbm-create-outline-markdown course outline.md index.md
+#
+# Every list item ("-", "*" or "+", at any depth, also "- [ ] task" items) gets a page
+# holding "# <item text>", and in the outline its text becomes [text](page). An item
+# that holds a link already is left alone, and so are numbered lists, code blocks and
+# front matter. A page that exists is never overwritten; items that give the same page
+# name share the page. The links hold the page name only, so the pages belong in the
+# folder where the linked outline is kept.
+#
+# The page name is PREFIX, then the item's text with A-Z in lower case and every run of
+# characters other than letters, digits, ".", "_" and "-" turned into one "_" (none at
+# the start or the end), then ".md": "Getting Started" gives gen_getting_started.md and
+# "TCP/IP: Q&A" gives gen_tcp_ip_q_a.md. Letters outside a-z, such as ö or ş, stay as
+# they are.
+#
+# Exit status: 0 done, 1 a file or folder is missing, could not be written, or
+# overwriting OUTPUT.md was not confirmed, 2 wrong usage.
 
-# Check that the script was invoked with the correct number of arguments
-if [ "$#" -ne 3 ]; then
-  echo "Usage: $0 <input_file> <output_file>"
-  exit 1
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%create-outline-markdown}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+DRY=0
+YES=0
+PAGES=""
+PREFIX="gen_"
+ARGS=()   # what is not an option; options may stand anywhere before a "--"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    -d|--pages-dir)
+      [ $# -ge 2 ] && [ -n "$2" ] || bad_usage "$1 needs a folder"
+      PAGES="$2"
+      shift ;;
+    -p|--prefix)
+      [ $# -ge 2 ] || bad_usage "$1 needs a prefix"
+      PREFIX="$2"
+      shift ;;
+    --) shift; while [ $# -gt 0 ]; do ARGS[${#ARGS[@]}]="$1"; shift; done; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) ARGS[${#ARGS[@]}]="$1" ;;
+  esac
+  shift
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+case "$PREFIX" in */*) bad_usage "the prefix must not contain '/': $PREFIX" ;; esac
+
+# dir_of PATH - the folder a file is in
+dir_of() { case "$1" in /*/*) echo "${1%/*}" ;; /*) echo / ;; */*) echo "${1%/*}" ;; *) echo . ;; esac; }
+
+case $# in
+  1) in="$1"; out=""; [ -n "$PAGES" ] || PAGES="$(dir_of "$in")" ;;
+  2) in="$1"; out="$2"; [ -n "$PAGES" ] || PAGES="$(dir_of "$out")" ;;
+  3) [ -z "$PAGES" ] || bad_usage "-d cannot be used with the three-argument form"
+     in="${1%/}/$2"; out="${1%/}/$3"; PAGES="$1" ;;
+  0) bad_usage "no outline given" ;;
+  *) bad_usage "too many arguments" ;;
+esac
+[ -f "$in" ] || die "no such file: $in"
+[ -r "$in" ] || die "cannot read $in"
+[ -d "$PAGES" ] || die "no such folder for the pages: $PAGES"
+if [ -n "$out" ]; then
+  [ ! -d "$out" ] || die "$out is a folder"
+  [ -d "$(dir_of "$out")" ] || die "no such folder: $(dir_of "$out")"
+  [ ! "$out" -ef "$in" ] || die "OUTPUT.md is the outline itself, which is never changed: $out"
 fi
 
-input_file_name="$1/$2"
-output_file_name="$1/$3"
+confirm() {   # confirm "Delete 3 files?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
 
-cp $2 $3
+# Notes go to standard output, unless that carries the outline.
+if [ "$DRY" = 1 ] || [ -z "$out" ]; then exec 3>&2; else exec 3>&1; fi
+note() { printf '%s\n' "$*" >&3; }
 
-# loop through the lines in the file
-sed '/^$/d' $input_file_name | awk '/^[-]/ {print $0}' | while read line; do
-  # extract the list item and convert to link label
-  label=${line:2}
-  label=${label%$'\r'}
-  link_label=$(echo "$label" | awk '{print tolower($0)}' | sed 's/ /_/g')
+if [ -n "$out" ] && [ -e "$out" ]; then
+  if [ "$DRY" = 1 ]; then
+    note "would overwrite $out"
+  else
+    confirm "Overwrite $out?" || die "$out was not overwritten and no page was created"
+  fi
+fi
 
-  # create the link and replace the list item in the line
-  # # Escape special characters with sed
-  # myvar_escaped=$(echo "$myvar" | sed 's/[\/$*.]/\\&/g')
-  touch "$1/gen_$link_label.md"
-  link="[$label](gen_$link_label.md)"
-  line=${line/- /$link}
+# slug TEXT - the page name without the prefix and without .md (the rule is in the help)
+slug() {
+  local s
+  # shellcheck disable=SC2018,SC2019  # a-z on purpose: [:upper:] turns I into a dotless i in a Turkish locale
+  s="$(printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -cs 'a-z0-9._\200-\377-' '_')"
+  s="${s#_}"
+  printf '%s' "${s%_}"
+}
 
+made=0
+had=0
+seen="
+"
+# make_page NAME TITLE - a stub page in $PAGES, unless it is there already
+make_page() {
+  case "$seen" in *"
+$1
+"*) return 0 ;; esac
+  seen="$seen$1
+"
+  if [ -e "$PAGES/$1" ] || [ -L "$PAGES/$1" ]; then
+    had=$((had + 1))
+    return 0
+  fi
+  if [ "$DRY" = 1 ]; then
+    note "would create ${PAGES%/}/$1"
+  else
+    printf '# %s\n' "$2" > "$PAGES/$1" || die "cannot write ${PAGES%/}/$1"
+    note "created ${PAGES%/}/$1"
+  fi
+  made=$((made + 1))
+}
 
-  # replace the line in the file
-  sed -i '.bak' "s/${label}/${link}/g" $input_file_name
+tmp="$(mktemp)" || die "cannot make a temporary file"
+trap 'rm -f "$tmp"' EXIT
 
-done
+# 1: the bullet (with a task box), 3: the text, 4: spaces and a carriage return at the end
+item='^([[:space:]]*[-*+][[:space:]]+(\[[ xX]\][[:space:]]+)?)(.*[^[:space:]])([[:space:]]*)$'
+rule='^[[:space:]]*(([-][[:space:]]*){3,}|([*][[:space:]]*){3,})$'   # "- - -" is a line, not a list
+fence='^[[:space:]]*(```|~~~)'
+lineno=0
+front=0
+code=0
+while IFS= read -r line || [ -n "$line" ]; do
+  lineno=$((lineno + 1))
+  bare="${line%$'\r'}"
+  if [ "$front" = 1 ]; then
+    case "$bare" in ---|...) front=0 ;; esac
+  elif [ "$lineno" = 1 ] && [ "$bare" = "---" ]; then
+    front=1
+  elif [[ $bare =~ $fence ]]; then
+    code=$((1 - code))
+  elif [ "$code" = 0 ] && ! [[ $bare =~ $rule ]] && [[ $line =~ $item ]]; then
+    lead="${BASH_REMATCH[1]}" text="${BASH_REMATCH[3]}" trail="${BASH_REMATCH[4]}"
+    case "$text" in
+      *']('*|*']['*) ;;
+      *) name="$(slug "$text")"
+         if [ -n "$name" ]; then
+           make_page "$PREFIX$name.md" "$text"
+           line="${lead}[$text]($PREFIX$name.md)$trail"
+         else
+           echo "$ME: line $lineno: no page name can be made from '$text'; left as it is" >&2
+         fi ;;
+    esac
+  fi
+  printf '%s\n' "$line"
+done < "$in" > "$tmp"
 
-backup_file_name=${input_file_name}.bak
-mv $output_file_name $backup_file_name
-mv $input_file_name $output_file_name
-mv $backup_file_name $input_file_name
+if [ "$DRY" = 1 ] || [ -z "$out" ]; then
+  cat "$tmp"
+else
+  cat "$tmp" > "$out" || die "cannot write $out"
+fi
+if [ "$DRY" = 1 ]; then
+  note "Dry run, nothing was written. Pages that would be created in $PAGES: $made; there already: $had."
+else
+  note "Pages created in $PAGES: $made; there already: $had${out:+; the linked outline is in $out}."
+fi

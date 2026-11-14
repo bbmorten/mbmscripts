@@ -1,298 +1,262 @@
 #!/usr/bin/env bash
-#
-# mbm-sync-git-msp-v2 — Sync local git-msp folder to remote host via rsync
+# mbm-sync-git-msp-v2 - mirror a local folder to a remote host with rsync, with progress and a history
 #
 # Usage:
-#   mbm-sync-git-msp-v2              # normal sync with live progress
-#   mbm-sync-git-msp-v2 --dry-run    # preview changes, don't touch anything
-#   mbm-sync-git-msp-v2 --watch      # auto-sync on file changes (requires fswatch)
-#   mbm-sync-git-msp-v2 --history    # show sync history from CSV
-#   mbm-sync-git-msp-v2 --help       # show help
+#   mbm-sync-git-msp-v2 [options]
+#   mbm-sync-git-msp-v2 --history
 #
+# The remote folder becomes a copy of the local one: new and changed files are sent, and
+# files on the remote side that are no longer in the local folder are DELETED there
+# (rsync --delete). Run it with --dry-run first; that lists what would be sent and deleted.
+# These are left alone on both sides, never sent and never deleted: .git/ node_modules/
+# .next/ .nuxt/ dist/ build/ out/ __pycache__/ *.pyc .venv/ venv/ .env .env.local vendor/
+# .DS_Store *.log .idea/ .vscode/ coverage/ .cache/
+#
+# It does the job of mbm-sync-git-msp and adds three things: a progress line while it runs
+# (one for the whole run with rsync 3.1 or newer, one per file with an older rsync or the
+# openrsync of macOS), a one-line summary after each run, and a history of the runs.
+#
+# Options:
+#   -s, --source DIR    local folder to send (default: ~/git-msp/)
+#   -H, --host HOST     remote host, as HOST or USER@HOST (no default)
+#   -u, --user USER     user on the remote host (default: your local user name)
+#   -d, --dest DIR      folder on the remote host, relative to the home folder there
+#                       unless it starts with / (default: git-msp/)
+#   -x, --exclude PAT   leave out one more rsync pattern; may be given several times
+#   -n, --dry-run       list what would be sent and deleted; change nothing, and add
+#                       nothing to the history
+#   -w, --watch         sync now, then again after every change in the local folder,
+#                       until Ctrl+C; changes that come together make one sync
+#       --history       show the last 20 recorded runs and stop; needs no host
+#   -y, --yes           do not ask before syncing
+#   -h, --help          show this help
+# A long option also takes its value as --option=VALUE, for example --host=nas.example.com.
+#
+# Examples:
+#   mbm-sync-git-msp-v2 -H nas.example.com --dry-run
+#   mbm-sync-git-msp-v2 -H nas.example.com
+#   mbm-sync-git-msp-v2 --history
+#   mbm-sync-git-msp-v2 -s ~/Projects/site -H web1.example.com -u deploy -d /srv/site -x '*.tmp'
+#   mbm-sync-git-msp-v2 -H nas.example.com --watch --yes
+#
+# Needs: rsync and ssh; --watch also needs fswatch (brew install fswatch). macOS and Linux.
+# Settings (each one is the default of an option):
+#   MBM_SYNC_SOURCE_DIR       --source
+#   MBM_SYNC_V2_REMOTE_HOST   --host; when it is not set, MBM_REMOTE_HOST
+#   MBM_REMOTE_USER           --user
+#   MBM_SYNC_REMOTE_DIR       --dest
+# Files, in ~/.local/log/sync-git-msp/:
+#   sync-YYYY-MM-DD.log   what each run printed, without the progress lines
+#   stats.csv             the history, one line per run that was not a dry run: when it
+#                         ended, seconds, files in the folder, files sent, files deleted,
+#                         bytes in the folder, bytes sent, bytes received, bytes per second,
+#                         speedup, rsync's exit code
+# Exit status: 0 synced, 1 the sync failed or was not confirmed, 2 wrong usage.
 
-set -euo pipefail
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%sync-git-msp-v2}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
 
-# ─── Configuration ──────────────────────────────────────────────────────────
-SOURCE_DIR="${MBM_SYNC_SOURCE_DIR:-$HOME/git-msp/}"
-REMOTE_USER="${MBM_REMOTE_USER:-$USER}"
-REMOTE_HOST="${MBM_SYNC_V2_REMOTE_HOST:-${MBM_REMOTE_HOST:-}}"
-REMOTE_DIR="${MBM_SYNC_REMOTE_DIR:-git-msp/}"
-
-# SSH options (uncomment and adjust if needed)
-# SSH_PORT=22
-# SSH_KEY="$HOME/.ssh/id_ed25519"
-# SSH_OPTS="-e \"ssh -p ${SSH_PORT} -i ${SSH_KEY}\""
-
-# Log directory and files
+SRC="${MBM_SYNC_SOURCE_DIR:-$HOME/git-msp/}"
+HOST="${MBM_SYNC_V2_REMOTE_HOST:-${MBM_REMOTE_HOST:-}}"
+RUSER="${MBM_REMOTE_USER:-${USER:-$(id -un)}}"
+DEST="${MBM_SYNC_REMOTE_DIR:-git-msp/}"
+DRY=0
+WATCH=0
+YES=0
+HISTORY=0
+EXCLUDES=(.git/ node_modules/ .next/ .nuxt/ dist/ build/ out/ __pycache__/ '*.pyc' .venv/ venv/
+          .env .env.local vendor/ .DS_Store '*.log' .idea/ .vscode/ coverage/ .cache/)
 LOG_DIR="$HOME/.local/log/sync-git-msp"
-LOG_FILE="${LOG_DIR}/sync-$(date +%Y-%m-%d).log"
-STATS_CSV="${LOG_DIR}/stats.csv"
+CSV="$LOG_DIR/stats.csv"
+CSV_HEAD="timestamp,duration_sec,files_total,files_transferred,files_deleted,bytes_total,bytes_sent,bytes_received,transfer_rate,speedup,exit_code"
+# awk: 1536 -> "1.5 KB"
+HUMAN='function human(b,   u, i) { split("B KB MB GB TB", u, " "); i = 1
+  while (b >= 1024 && i < 5) { b /= 1024; i++ }
+  return sprintf(i == 1 ? "%d %s" : "%.1f %s", b, u[i]) }'
 
-# Exclude patterns
-EXCLUDES=(
-  --exclude='.git/'
-  --exclude='node_modules/'
-  --exclude='.next/'
-  --exclude='.nuxt/'
-  --exclude='dist/'
-  --exclude='build/'
-  --exclude='out/'
-  --exclude='__pycache__/'
-  --exclude='*.pyc'
-  --exclude='.venv/'
-  --exclude='venv/'
-  --exclude='.env'
-  --exclude='.env.local'
-  --exclude='vendor/'
-  --exclude='.DS_Store'
-  --exclude='*.log'
-  --exclude='.idea/'
-  --exclude='.vscode/'
-  --exclude='coverage/'
-  --exclude='.cache/'
-)
-
-# ─── Helpers ────────────────────────────────────────────────────────────────
-RED=$'\033[0;31m'
-GREEN=$'\033[0;32m'
-YELLOW=$'\033[0;33m'
-BLUE=$'\033[0;34m'
-CYAN=$'\033[0;36m'
-BOLD=$'\033[1m'
-NC=$'\033[0m'
-
-log() {
-  local level="$1"; shift
-  local msg="$*"
-  local ts
-  ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  local color="$NC"
-  case "$level" in
-    INFO)  color="$BLUE"   ;;
-    OK)    color="$GREEN"  ;;
-    WARN)  color="$YELLOW" ;;
-    ERROR) color="$RED"    ;;
-    STAT)  color="$CYAN"   ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -n|--dry-run) DRY=1; shift ;;
+    -w|--watch) WATCH=1; shift ;;
+    -y|--yes) YES=1; shift ;;
+    --history) HISTORY=1; shift ;;
+    --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;;   # --host=NAME is --host NAME
+    -s|--source|-H|--host|-u|--user|-d|--dest|-x|--exclude)
+      [ $# -ge 2 ] || bad_usage "option $1 needs a value"
+      case "$1" in
+        -s|--source) SRC="$2" ;;
+        -H|--host) HOST="$2" ;;
+        -u|--user) RUSER="$2" ;;
+        -d|--dest) DEST="$2" ;;
+        *) EXCLUDES+=("$2") ;;
+      esac
+      shift 2 ;;
+    --) shift; [ $# -eq 0 ] || bad_usage "unexpected argument: $1" ;;
+    -*) bad_usage "unknown option: $1" ;;
+    *) bad_usage "unexpected argument: $1" ;;
   esac
-  printf '%s[%s] [%s]%s %s\n' "$color" "$ts" "$level" "$NC" "$msg"
-  printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE"
-}
+done
 
-show_help() {
-  cat <<EOF
-mbm-sync-git-msp-v2 — Sync ${SOURCE_DIR} → ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}
-
-Usage:
-  $0              Normal sync with live progress and stats
-  $0 --dry-run    Preview changes without modifying anything
-  $0 --watch      Continuously watch for changes and auto-sync (needs fswatch)
-  $0 --history    Show last 20 sync runs from stats history
-  $0 --help       Show this help
-
-Logs:   ${LOG_DIR}/sync-YYYY-MM-DD.log
-Stats:  ${STATS_CSV}
-EOF
-}
-
-# Initialize the stats CSV with a header if it doesn't exist
-init_stats_csv() {
-  if [[ ! -f "$STATS_CSV" ]]; then
-    echo "timestamp,duration_sec,files_total,files_transferred,files_deleted,bytes_total,bytes_sent,bytes_received,transfer_rate,speedup,exit_code" > "$STATS_CSV"
-  fi
-}
-
-# Convert a byte count to human-readable (KB/MB/GB)
-human_bytes() {
-  local b="${1:-0}"
-  b="${b//[^0-9.]/}"
-  [[ -z "$b" || "$b" == "0" ]] && { echo "0 B"; return; }
-  awk -v b="$b" 'BEGIN {
-    split("B KB MB GB TB", u);
-    i = 1;
-    while (b >= 1024 && i < 5) { b /= 1024; i++ }
-    printf "%.2f %s", b, u[i]
-  }'
-}
-
-# Parse rsync --stats output and append a row to the CSV
-parse_and_record_stats() {
-  local out="$1"
-  local duration="$2"
-  local rc="$3"
-  local ts
-  ts="$(date '+%Y-%m-%d %H:%M:%S')"
-
-  local files_total files_xferred files_deleted bytes_total bytes_sent bytes_recv rate speedup
-
-  # Use awk to pull each value, stripping commas
-  files_total=$(awk -F'[:,]' '/^Number of files:/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$out" 2>/dev/null)
-  files_xferred=$(awk -F':' '/^Number of regular files transferred:/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$out" 2>/dev/null)
-  files_deleted=$(awk -F':' '/^Number of deleted files:/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$out" 2>/dev/null)
-  bytes_total=$(awk -F':' '/^Total file size:/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$out" 2>/dev/null)
-  bytes_sent=$(awk -F':' '/^Total bytes sent:/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$out" 2>/dev/null)
-  bytes_recv=$(awk -F':' '/^Total bytes received:/ {gsub(/[^0-9]/,"",$2); print $2; exit}' "$out" 2>/dev/null)
-
-  # "sent X bytes  received Y bytes  Z bytes/sec"
-  rate=$(awk '/bytes\/sec$/ {gsub(/,/,"",$(NF-1)); print $(NF-1); exit}' "$out" 2>/dev/null)
-
-  # "total size is X  speedup is Y"
-  speedup=$(awk '/speedup is/ {for(i=1;i<=NF;i++) if($i=="is" && $(i-1)=="speedup") {print $(i+1); exit}}' "$out" 2>/dev/null)
-
-  : "${files_total:=0}"
-  : "${files_xferred:=0}"
-  : "${files_deleted:=0}"
-  : "${bytes_total:=0}"
-  : "${bytes_sent:=0}"
-  : "${bytes_recv:=0}"
-  : "${rate:=0}"
-  : "${speedup:=0}"
-
-  echo "${ts},${duration},${files_total},${files_xferred},${files_deleted},${bytes_total},${bytes_sent},${bytes_recv},${rate},${speedup},${rc}" >> "$STATS_CSV"
-
-  local rate_human sent_human recv_human total_human
-  rate_human=$(human_bytes "$rate")
-  sent_human=$(human_bytes "$bytes_sent")
-  recv_human=$(human_bytes "$bytes_recv")
-  total_human=$(human_bytes "$bytes_total")
-
-  log STAT "─── Run Summary ───"
-  log STAT "  Duration:           ${duration}s"
-  log STAT "  Files scanned:      ${files_total}"
-  log STAT "  Files transferred:  ${files_xferred}"
-  log STAT "  Files deleted:      ${files_deleted}"
-  log STAT "  Total size:         ${total_human}"
-  log STAT "  Bytes sent:         ${sent_human}"
-  log STAT "  Bytes received:     ${recv_human}"
-  log STAT "  Avg throughput:     ${rate_human}/s"
-  log STAT "  Speedup ratio:      ${speedup}x"
-}
-
-show_history() {
-  if [[ ! -f "$STATS_CSV" ]]; then
-    log WARN "No history yet at $STATS_CSV"
+if [ "$HISTORY" = 1 ]; then
+  [ "$DRY$WATCH" = 00 ] || bad_usage "--history goes alone, not with --dry-run or --watch"
+  if [ ! -f "$CSV" ] || [ "$(grep -c -v '^timestamp,' "$CSV")" -eq 0 ]; then
+    echo "No run has been recorded yet ($CSV)."
     exit 0
   fi
-  echo
-  printf '%sLast 20 sync runs%s (from %s)\n\n' "$BOLD" "$NC" "$STATS_CSV"
-  {
-    echo "TIMESTAMP|DUR(s)|XFER|DEL|SENT|RATE/s|RC"
-    tail -n 20 "$STATS_CSV" | awk -F',' 'NR>0 && $1 != "timestamp" {
-      split("B KB MB GB TB", u)
-      sent = $7; i=1; while (sent>=1024 && i<5) { sent/=1024; i++ }
-      rate = $9; j=1; while (rate>=1024 && j<5) { rate/=1024; j++ }
-      printf "%s|%s|%s|%s|%.1f %s|%.1f %s|%s\n", $1, $2, $4, $5, sent, u[i], rate, u[j], $11
-    }'
-  } | column -t -s '|'
-  echo
+  echo "The last runs, newest at the bottom ($CSV):"
+  grep -v '^timestamp,' "$CSV" | tail -n 20 | LC_ALL=C awk -F, "$HUMAN"'
+    BEGIN { f = "%-19s  %7s  %7s  %7s  %10s  %12s  %4s\n"
+            printf f, "ENDED", "SECONDS", "SENT", "DELETED", "BYTES SENT", "RATE", "EXIT" }
+    { printf f, $1, $2, $4, $5, human($7), human($9) "/s", $11 }'
+  exit 0
+fi
+
+[ -n "$HOST" ] || bad_usage "no remote host: use --host HOST or set MBM_SYNC_V2_REMOTE_HOST or MBM_REMOTE_HOST"
+case "$HOST" in *@*) TARGET="$HOST" ;; *) TARGET="$RUSER@$HOST" ;; esac
+case "$TARGET" in -*|*@-*|*@) bad_usage "not a host name: $HOST" ;; esac
+# shellcheck disable=SC2088  # the tilde is meant as text: rsync would hand it to the remote shell
+case "$DEST" in
+  ''|.|./|/|'~'|'~/') bad_usage "--dest '$DEST' is a whole home or root folder; name a folder inside it" ;;
+esac
+[ -d "$SRC" ] || die "source folder not found: $SRC"
+# An absolute path with one slash at the end: rsync then sends what is IN the folder.
+SRC="$(CDPATH='' cd -- "$SRC" && pwd)" || die "cannot open the source folder: $SRC"
+SRC="${SRC%/}/"
+[ -n "$(ls -A -- "$SRC" 2>/dev/null)" ] ||
+  die "the source folder is empty: $SRC - not syncing, that would delete everything in $TARGET:$DEST"
+command -v rsync >/dev/null 2>&1 || die "rsync is not installed (Linux: apt install rsync)"
+command -v ssh >/dev/null 2>&1 || die "ssh is not installed (Linux: apt install openssh-client)"
+if [ "$WATCH" = 1 ]; then
+  command -v fswatch >/dev/null 2>&1 || die "fswatch is not installed (brew install fswatch); --watch needs it"
+fi
+
+confirm() {   # confirm "Delete 3 files?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+logfile() { echo "$LOG_DIR/sync-$(date +%Y-%m-%d).log"; }   # per call: a watch can run past midnight
+log() {       # log LEVEL TEXT - one line on the terminal and in the log file
+  printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" | tee -a "$(logfile)"
+}
+
+# The progress option. --info=progress2 came with rsync 3.1; an older rsync, and the openrsync
+# of macOS ("rsync version 2.6.9 compatible"), stop with a usage error when they get it.
+progress_option() {
+  local major minor
+  read -r major minor <<< "$(rsync --version 2>/dev/null |
+    sed -n 's/.*rsync  *version  *\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p' | head -n 1)"
+  if [ "${major:-0}" -gt 3 ] || { [ "${major:-0}" -eq 3 ] && [ "${minor:-0}" -ge 1 ]; }; then
+    echo --info=progress2
+  else
+    echo --progress
+  fi
+}
+
+# No --human-readable here: the numbers of --stats are read back below.
+RSYNC=(rsync -az --stats)
+NOTE=""
+if [ "$DRY" = 1 ]; then
+  RSYNC+=(-v --dry-run)
+  NOTE="dry run, nothing is changed: "
+else
+  RSYNC+=("$(progress_option)")
+fi
+RSYNC+=(--delete)
+for p in "${EXCLUDES[@]}"; do RSYNC+=("--exclude=$p"); done
+RSYNC+=(-- "$SRC" "$TARGET:$DEST")
+
+# stats < RSYNC-OUTPUT - eight numbers with commas between them: files in the folder, files
+# sent, files deleted, bytes in the folder, bytes sent, bytes received, bytes per second,
+# speedup. rsync 3 writes 1,234 (1.234 in some languages) and "Number of regular files
+# transferred"; rsync 2.6.9 and openrsync write plain numbers and name no deleted files.
+stats() {
+  LC_ALL=C tr '\r' '\n' | LC_ALL=C awk '
+    function digits(s) { gsub(/[^0-9]/, "", s); return s + 0 }
+    function first(s) { sub(/^[^:]*: */, "", s); sub(/ .*/, "", s); return digits(s) }
+    function decimal(s) { return s ~ /[.,][0-9][0-9]$/ ? digits(s) / 100 : digits(s) }
+    /^Number of files:/ { total = first($0) }
+    /^Number of (regular )?files transferred:/ { sent = first($0) }
+    /^Number of deleted files:/ { deleted = first($0); counted = 1 }
+    /^deleting / { seen++ }
+    /^Total file size:/ { size = first($0) }
+    /^sent .* bytes +received .* bytes/ { out = digits($2); back = digits($5); rate = decimal($(NF - 1)) }
+    /^total size is .* speedup is / { for (i = 1; i < NF; i++) if ($i == "speedup") speedup = decimal($(i + 2)) }
+    END { printf "%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%.2f,%.2f\n",
+                 total, sent, counted ? deleted : seen, size, out, back, rate, speedup }'
 }
 
 run_sync() {
-  local extra_flags=("$@")
-  local stats_tmp
-  stats_tmp=$(mktemp -t rsync-stats.XXXXXX)
-
-  # NOTE: --info=progress2 gives the single-line live "throughput graph"
-  # showing bytes transferred, percentage, throughput, and ETA.
-  # We drop -v in favor of progress2 so the live display stays clean.
-  local rsync_cmd=(
-    rsync
-    -az
-    --human-readable
-    --stats
-    --info=progress2
-    --delete
-    "${EXCLUDES[@]}"
-    "${extra_flags[@]}"
-    "$SOURCE_DIR"
-    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
-  )
-
-  log INFO "Starting rsync: ${SOURCE_DIR} → ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}"
-  log INFO "Command: ${rsync_cmd[*]}"
-
-  local start_ts end_ts duration rc
-  start_ts=$(date +%s)
-
-  # Tee live output to terminal, daily log, and a temp file we'll parse
-  set +e
-  "${rsync_cmd[@]}" 2>&1 | tee -a "$stats_tmp" "$LOG_FILE"
-  rc=${PIPESTATUS[0]}
-  set -e
-
-  end_ts=$(date +%s)
-  duration=$((end_ts - start_ts))
-
-  parse_and_record_stats "$stats_tmp" "$duration" "$rc"
-  rm -f "$stats_tmp"
-
-  if [[ "$rc" -eq 0 ]]; then
-    log OK "Sync completed successfully in ${duration}s"
-  else
-    log ERROR "Sync failed with exit code ${rc} after ${duration}s"
+  local start secs rc row
+  log INFO "$NOTE$SRC -> $TARGET:$DEST"
+  log RUN "${RSYNC[*]}" >/dev/null
+  start="$(date +%s)"
+  "${RSYNC[@]}" 2>&1 | tee "$OUTPUT"
+  rc="${PIPESTATUS[0]}"
+  secs=$(($(date +%s) - start))
+  # The log gets the output without the progress lines ("  1,234,567  45%  2.10MB/s ...").
+  LC_ALL=C tr '\r' '\n' < "$OUTPUT" | LC_ALL=C grep -E -v '^ *[0-9][0-9.,]* +[0-9]+%|^$' >> "$(logfile)"
+  if [ "$DRY" = 0 ]; then
+    row="$(stats < "$OUTPUT")"
+    log STAT "$(echo "$secs,$row" | LC_ALL=C awk -F, "$HUMAN"'
+      { printf "%d of %d files sent, %d deleted, %s sent, %s received, %s/s, in %ds",
+               $3, $2, $4, human($6), human($7), human($8), $1 }')"
+    [ -s "$CSV" ] || echo "$CSV_HEAD" > "$CSV"
+    echo "$(date '+%Y-%m-%d %H:%M:%S'),$secs,$row,$rc" >> "$CSV"
   fi
-  return "$rc"
+  if [ "$rc" -eq 0 ]; then
+    log OK "done"
+    return 0
+  fi
+  log ERROR "rsync failed with exit code $rc" >/dev/null
+  echo "$ME: rsync failed with exit code $rc (log: $(logfile))" >&2
+  return 1
 }
 
-watch_mode() {
-  if ! command -v fswatch >/dev/null 2>&1; then
-    log ERROR "fswatch is required for --watch mode. Install with: brew install fswatch"
-    exit 1
-  fi
+if [ "$DRY" = 0 ]; then
+  confirm "Mirror $SRC to $TARGET:$DEST? Files there that are not in the local folder are deleted." ||
+    die "nothing synced"
+fi
+mkdir -p "$LOG_DIR" || die "cannot create the log folder: $LOG_DIR"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/sync-work.XXXXXX")" || die "cannot create a temporary folder"
+WATCHER=""
+trap '[ -n "$WATCHER" ] && kill "$WATCHER" 2>/dev/null; rm -rf "$WORK"' EXIT
+OUTPUT="$WORK/output"   # what rsync printed in the run at hand
 
-  log INFO "Watch mode active. Monitoring ${SOURCE_DIR} for changes... (Ctrl+C to stop)"
-
-  run_sync || log WARN "Initial sync failed, continuing to watch..."
-
-  fswatch -o \
-    --exclude='\.git/' \
-    --exclude='node_modules/' \
-    --exclude='\.next/' \
-    --exclude='dist/' \
-    --exclude='build/' \
-    --exclude='__pycache__/' \
-    --exclude='\.venv/' \
-    --exclude='\.DS_Store' \
-    "$SOURCE_DIR" \
-  | while read -r _; do
-      log INFO "Change detected, syncing..."
-      run_sync || log WARN "Sync failed, will retry on next change"
-    done
-}
-
-if [[ -z "$REMOTE_HOST" && "${1:-}" != "-h" && "${1:-}" != "--help" ]]; then
-  echo "No remote host is set. Export MBM_REMOTE_HOST (for example in the local.env file of your installation)." >&2
-  exit 1
+if [ "$WATCH" = 0 ]; then
+  run_sync
+  exit $?
 fi
 
-# ─── Main ───────────────────────────────────────────────────────────────────
-mkdir -p "$LOG_DIR"
-init_stats_csv
-
-if [[ ! -d "$SOURCE_DIR" ]]; then
-  log ERROR "Source directory does not exist: $SOURCE_DIR"
-  exit 1
-fi
-
-case "${1:-}" in
-  -h|--help)
-    show_help
-    ;;
-  -n|--dry-run)
-    log INFO "DRY RUN — no changes will be made"
-    run_sync --dry-run
-    ;;
-  -w|--watch)
-    watch_mode
-    ;;
-  --history)
-    show_history
-    ;;
-  '')
-    run_sync
-    ;;
-  *)
-    log ERROR "Unknown option: $1"
-    show_help
-    exit 1
-    ;;
-esac
+# fswatch takes regular expressions on whole paths; the rsync patterns are turned into them
+# as well as that goes (.git/ becomes /\.git(/|$)). A miss only costs a sync with nothing to do.
+# The log folder is left out too: a sync writes there, which would start the next sync.
+FSWATCH=(fswatch -o -r -E "--exclude=^$LOG_DIR/")
+for p in "${EXCLUDES[@]}"; do
+  FSWATCH+=("--exclude=/$(printf '%s' "${p%/}" | sed -e 's/[][\.^$+?(){}|]/\\&/g' -e 's/\*/[^\/]*/g')(/|\$)")
+done
+# fswatch runs beside the loop and writes into a named pipe. A change during a sync waits
+# there, and when this script ends, however it ends, fswatch is stopped with it.
+mkfifo "$WORK/changes" || die "cannot create a pipe in $WORK"
+"${FSWATCH[@]}" "$SRC" > "$WORK/changes" &
+WATCHER=$!
+exec 3< "$WORK/changes"
+log INFO "watching $SRC (Ctrl+C stops)"
+run_sync </dev/null
+while read -r _; do
+  while read -r -t 1 _; do :; done   # wait for a quiet second: a burst of changes is one sync
+  run_sync </dev/null
+done <&3
+wait "$WATCHER"
+rc=$?
+WATCHER=""
+[ "$rc" -eq 0 ] || die "fswatch stopped with exit status $rc"

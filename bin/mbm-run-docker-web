@@ -1,13 +1,142 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
+# mbm-run-docker-web - build a mkdocs site, copy it to a remote host and serve it there with nginx in Docker
+#
+# Usage:
+#   mbm-run-docker-web [-d PROJECT_DIR] [-u USER] [-t REMOTE_DIR] [-p PORT] [-n] HOST [PORT]
+#
+# Arguments:
+#   HOST                    the remote machine: a name, an address or an ssh alias.
+#                           USER@HOST works too and then -u is not used.
+#   PORT                    the same as -p PORT
+#
+# Options:
+#   -d, --dir PROJECT_DIR   the mkdocs project to publish
+#                           (default: $MBM_DOCKER_WEB_DIR, else ~/git-repos/docker)
+#   -u, --user USER         the ssh user on HOST (default: $MBM_DOCKER_WEB_USER, else vm);
+#                           -u "" names no user and leaves the choice to ssh
+#   -t, --to REMOTE_DIR     the folder on HOST that receives the site, relative to the home
+#                           folder there (default: $MBM_DOCKER_WEB_REMOTE_DIR, else the name
+#                           of PROJECT_DIR: ~/git-repos/docker goes to ~/docker on HOST)
+#   -p, --port PORT         the port on HOST where the site is served (default: 5500)
+#   -n, --dry-run           print the three commands; run nothing
+#   -h, --help              show this help
+#
+# Three steps, and it stops at the first one that fails:
+#   1. "mkdocs build" in PROJECT_DIR, with the mkdocs of PROJECT_DIR/.venv when there is one
+#   2. rsync PROJECT_DIR/site/ to USER@HOST:REMOTE_DIR/ (files are added and replaced there,
+#      never deleted)
+#   3. on HOST, start an nginx container named docs-web-PORT that serves REMOTE_DIR on PORT
+# A container of that name left by an earlier run is replaced, so repeat the command after
+# every change. To take the site down: ssh USER@HOST docker rm -f docs-web-PORT
+# Everything in REMOTE_DIR is served to whoever reaches PORT: keep nothing else in it.
+#
+# Examples:
+#   mbm-run-docker-web lab-vm
+#   mbm-run-docker-web lab-vm 8080
+#   mbm-run-docker-web -n -d ~/projects/handbook -u deploy -t sites/handbook -p 8080 docs.example.com
+#
+# Needs: mkdocs (pip install mkdocs), rsync and ssh on this machine. On HOST: an ssh login for
+#        USER, rsync, and docker that USER may run without sudo. macOS and Linux.
+# Settings: MBM_DOCKER_WEB_DIR          the mkdocs project (default: ~/git-repos/docker)
+#           MBM_DOCKER_WEB_USER         the ssh user on HOST (default: vm)
+#           MBM_DOCKER_WEB_REMOTE_DIR   the folder on HOST (default: the name of the project folder)
 
-cd ~/git-repos/docker
-source ~/git-repos/docker/.venv/bin/activate
-mkdocs build
-rsync -avz ~/git-repos/docker/site/ vm@$1:~/docker/
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%run-docker-web}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+need() { [ $# -ge 2 ] || bad_usage "$1 needs a value"; }
 
-# Prompt user to enter a port number
-port=$2 || 5500
+DIR="${MBM_DOCKER_WEB_DIR:-$HOME/git-repos/docker}"
+RUSER="${MBM_DOCKER_WEB_USER:-vm}"
+RDIR="${MBM_DOCKER_WEB_REMOTE_DIR:-}"
+PORT=5500
+DRY=0; HOST=""; npos=0; opts=1
+while [ $# -gt 0 ]; do
+  if [ "$opts" = 1 ]; then
+    case "$1" in
+      -d|--dir) need "$@"; DIR="$2"; shift 2; continue ;;
+      -u|--user) need "$@"; RUSER="$2"; shift 2; continue ;;
+      -t|--to) need "$@"; RDIR="$2"; shift 2; continue ;;
+      -p|--port) need "$@"; PORT="$2"; shift 2; continue ;;
+      -n|--dry-run) DRY=1; shift; continue ;;
+      -h|--help) usage; exit 0 ;;
+      --) opts=0; shift; continue ;;
+      -*) bad_usage "unknown option: $1" ;;
+    esac
+  fi
+  npos=$((npos + 1))
+  case "$npos" in
+    1) HOST="$1" ;;
+    2) PORT="$1" ;;
+    *) bad_usage "too many arguments: $1" ;;
+  esac
+  shift
+done
+[ "$npos" -ge 1 ] || bad_usage "HOST is missing"
 
-# Start Nginx container with the specified port number
-ssh vm@$1 "docker run --rm -d -p $port:80 -v /home/vm/docker/:/usr/share/nginx/html:ro nginx"
+# HOST, USER and REMOTE_DIR end up on an ssh command line and in a command for the remote
+# shell, so only plain names are let through. The characters are written out because a-z
+# takes in more letters under some locales (Turkish, for one).
+OKCH='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-'
+plain() {   # plain TEXT [MORE]   true when TEXT has only OKCH and MORE, and no leading dash
+  # shellcheck disable=SC2254  # the two lists are one bracket pattern on purpose
+  case "$1" in -*|*[!${2:-}$OKCH]*) return 1 ;; esac
+}
+{ [ -n "$HOST" ] && plain "$HOST" '@'; } || bad_usage "not a host name: '$HOST'"
+plain "$RUSER" || bad_usage "not a user name: '$RUSER'"
+case "$PORT" in ''|*[!0123456789]*|??????*) bad_usage "PORT must be a number from 1 to 65535: '$PORT'" ;; esac
+PORT=$((10#$PORT))
+{ [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ]; } || bad_usage "PORT must be a number from 1 to 65535: '$PORT'"
+RDIR="${RDIR#\~/}"
+RDIR="${RDIR%/}"
+plain "$RDIR" / || bad_usage "REMOTE_DIR may hold letters, digits and . _ - / only: '$RDIR'"
 
+[ -d "$DIR" ] || die "no such folder: $DIR (name the mkdocs project with -d)"
+DIR="$(cd -- "$DIR" && pwd)" || die "cannot enter $DIR"
+[ -f "$DIR/mkdocs.yml" ] || [ -f "$DIR/mkdocs.yaml" ] || die "no mkdocs.yml in $DIR - that is not a mkdocs project"
+if [ -z "$RDIR" ]; then
+  # Named after the project, so that two projects never share a folder on HOST.
+  RDIR="${DIR##*/}"
+  RDIR="${RDIR//[!$OKCH]/-}"
+  { [ -n "$RDIR" ] && plain "$RDIR"; } || die "the folder on $HOST cannot be named after $DIR - name it with -t"
+fi
+
+# The project's own virtual environment first, as "source .venv/bin/activate" would do.
+if [ -d "$DIR/.venv/bin" ]; then
+  VIRTUAL_ENV="$DIR/.venv"
+  PATH="$VIRTUAL_ENV/bin:$PATH"
+  export VIRTUAL_ENV PATH
+  unset PYTHONHOME
+fi
+command -v mkdocs >/dev/null 2>&1 || die "mkdocs is not installed (pip install mkdocs, or install it into $DIR/.venv)"
+command -v rsync >/dev/null 2>&1 || die "rsync is not installed (part of macOS; on Linux the package rsync)"
+command -v ssh >/dev/null 2>&1 || die "ssh is not installed (part of macOS; on Linux the package openssh-client)"
+
+case "$HOST" in *@*) TARGET="$HOST" ;; *) TARGET="${RUSER:+$RUSER@}$HOST" ;; esac
+NAME="docs-web-$PORT"
+# Run by the remote shell, in the remote home folder. "$PWD" is the remote folder's full path.
+REMOTE="cd $RDIR || exit 1; docker rm -f $NAME >/dev/null 2>&1; docker run -d --name $NAME -p $PORT:80 -v \"\$PWD\":/usr/share/nginx/html:ro nginx"
+
+if [ "$DRY" = 1 ]; then
+  echo "Would run:"
+  printf '  cd %q && mkdocs build\n' "$DIR"
+  printf '  rsync -avz %q %q\n' "$DIR/site/" "$TARGET:$RDIR/"
+  printf "  ssh %q '%s'\n" "$TARGET" "$REMOTE"
+  exit 0
+fi
+
+echo "$ME: 1/3 building $DIR"
+( cd -- "$DIR" && mkdocs build ) || die "mkdocs build failed - nothing was copied"
+[ -d "$DIR/site" ] || die "mkdocs build left no site folder in $DIR (is site_dir changed in mkdocs.yml?) - nothing was copied"
+
+echo "$ME: 2/3 copying the site to $TARGET:$RDIR/"
+rsync -avz "$DIR/site/" "$TARGET:$RDIR/" || die "copying to $TARGET:$RDIR/ failed - the container on $HOST was not touched"
+
+echo "$ME: 3/3 starting the container $NAME on $TARGET"
+# shellcheck disable=SC2029  # REMOTE is put together here on purpose; only its \$PWD is for the remote shell
+ssh "$TARGET" "$REMOTE" || die "the container did not start on $TARGET. If port $PORT is taken, see what holds it: ssh $TARGET docker ps --filter publish=$PORT"
+
+echo "$ME: done - http://${HOST##*@}:$PORT/ serves $DIR/site (container $NAME on $TARGET)"

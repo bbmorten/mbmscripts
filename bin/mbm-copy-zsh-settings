@@ -1,348 +1,198 @@
 #!/usr/bin/env bash
-#
-# mbm-copy-zsh-settings — Copy local zsh config to remote macOS host
-#
-# Copies these if they exist locally:
-#   ~/.zshrc
-#   ~/.zshenv
-#   ~/.zprofile
-#   ~/.zlogin
-#   ~/.zlogout
-#   ~/.p10k.zsh
-#   ~/.aliases
-#   ~/.zsh_aliases
-#   ~/.zsh_functions
-#   ~/.config/zsh/  (whole directory if present)
-#
-# Skips:
-#   ~/.zsh_history     (personal)
-#   ~/.zcompdump*      (regenerated automatically)
-#   ~/.oh-my-zsh/      (installed fresh on remote)
-#
-# Behavior:
-#   - Backs up existing remote dotfiles to ~/.zsh-backup-<timestamp>/
-#   - Installs oh-my-zsh on remote if missing
-#   - Copies your local custom theme/plugin files from ~/.oh-my-zsh/custom/
-#     (so personal themes & plugins come along, but framework code is fresh)
-#   - Dry-run mode shows what would happen without changes
+# mbm-copy-zsh-settings - copy your zsh configuration to another machine over ssh
 #
 # Usage:
-#   mbm-copy-zsh-settings              # do the copy
-#   mbm-copy-zsh-settings --dry-run    # preview only
-#   mbm-copy-zsh-settings --help
+#   mbm-copy-zsh-settings [options]
 #
+# Options:
+#   -H, --host HOST   the machine to copy to: a name, an address or USER@HOST
+#                     (default: the setting MBM_REMOTE_HOST)
+#   -u, --user USER   the account there (default: the setting MBM_REMOTE_USER, else
+#                     your user name on this machine)
+#   -s, --skip NAME   leave NAME out, for example .zshenv; may be given several times
+#       --no-omz      never install oh-my-zsh on the other machine
+#   -n, --dry-run     show what would be copied and done; change nothing
+#   -y, --yes         do not ask before copying
+#   -h, --help        show this help
+#
+# What is copied, when it exists here, to the same place under the home folder there:
+#   .zshrc  .zshenv  .zprofile  .zlogin  .zlogout  .p10k.zsh  .aliases  .zsh_aliases
+#   .zsh_functions  .config/zsh  .oh-my-zsh/custom (your own themes and plugins)
+# Never copied: .zsh_history, .zcompdump*, oh-my-zsh itself.
+#
+# The files go to the other machine exactly as they are. If one of them holds
+# passwords or API keys (.zshenv often does), they go along: leave it out with --skip.
+# A symbolic link is copied as the file it points to.
+#
+# What happens on the other machine, after you said yes:
+#   1. Each of these that is there already is first copied to ~/.zsh-backup-DATE-TIME/.
+#   2. If you use oh-my-zsh here and it is missing there, its installer is downloaded
+#      from github.com/ohmyzsh/ohmyzsh and run there (needs zsh, curl and git there).
+#   3. The files are copied with rsync. In the folders, files that exist only there stay.
+#
+# Examples:
+#   mbm-copy-zsh-settings -H mac-mini.local -n
+#   mbm-copy-zsh-settings -H mac-mini.local --skip .zshenv
+#   mbm-copy-zsh-settings -H 192.0.2.10 -u admin --no-omz --yes
+#
+# Needs: ssh and rsync here, rsync on the other machine. macOS and Linux, on both ends.
+#        Port, key and other details of the connection belong in ~/.ssh/config.
+# Settings: MBM_REMOTE_HOST   the machine to copy to when --host is not given
+#           MBM_REMOTE_USER   the account there when --user is not given
 
-set -euo pipefail
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%copy-zsh-settings}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+confirm() {   # confirm "Delete 3 files?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
 
-# ─── Configuration ──────────────────────────────────────────────────────────
-REMOTE_USER="${MBM_REMOTE_USER:-$USER}"
-REMOTE_HOST="${MBM_REMOTE_HOST:-}"
-REMOTE="${REMOTE_USER}@${REMOTE_HOST}"
+# Everything this command ever copies, relative to the home folder. No name has a space.
+ITEMS=(.zshrc .zshenv .zprofile .zlogin .zlogout .p10k.zsh .aliases .zsh_aliases .zsh_functions .config/zsh .oh-my-zsh/custom)
+OMZ_INSTALLER="https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
 
-# SSH options (uncomment and adjust if needed)
-# SSH_PORT=22
-# SSH_KEY="$HOME/.ssh/id_ed25519"
-# SSH_OPTS=(-p "$SSH_PORT" -i "$SSH_KEY")
-SSH_OPTS=()
-
-LOG_DIR="$HOME/.local/log/copy-zsh-settings"
-LOG_FILE="${LOG_DIR}/copy-$(date +%Y-%m-%d_%H-%M-%S).log"
-
-# Files to copy if they exist locally (relative to $HOME)
-DOTFILES=(
-  ".zshrc"
-  ".zshenv"
-  ".zprofile"
-  ".zlogin"
-  ".zlogout"
-  ".p10k.zsh"
-  ".aliases"
-  ".zsh_aliases"
-  ".zsh_functions"
-)
-
-# Directories to copy (relative to $HOME)
-DOTDIRS=(
-  ".config/zsh"
-)
-
-# Whether to copy oh-my-zsh custom/ (themes + plugins you've added). Default: yes.
-COPY_OMZ_CUSTOM=true
-
-DRY_RUN=false
-
-# ─── Helpers ────────────────────────────────────────────────────────────────
-RED=$'\033[0;31m'
-GREEN=$'\033[0;32m'
-YELLOW=$'\033[0;33m'
-BLUE=$'\033[0;34m'
-CYAN=$'\033[0;36m'
-BOLD=$'\033[1m'
-NC=$'\033[0m'
-
-log() {
-  local level="$1"; shift
-  local msg="$*"
-  local ts
-  ts="$(date '+%Y-%m-%d %H:%M:%S')"
-  local color="$NC"
-  case "$level" in
-    INFO)  color="$BLUE"   ;;
-    OK)    color="$GREEN"  ;;
-    WARN)  color="$YELLOW" ;;
-    ERROR) color="$RED"    ;;
-    STAT)  color="$CYAN"   ;;
+HOST="${MBM_REMOTE_HOST:-}"
+RUSER="${MBM_REMOTE_USER:-}"
+SKIP=" "
+OMZ=1
+DRY=0
+YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -H|--host) [ $# -ge 2 ] || bad_usage "$1 needs a host"; HOST="$2"; shift ;;
+    -u|--user) [ $# -ge 2 ] || bad_usage "$1 needs a user name"; RUSER="$2"; shift ;;
+    -s|--skip)
+      [ $# -ge 2 ] || bad_usage "$1 needs a name"
+      n="${2#"$HOME"/}"; n="${n#\~/}"; n="${n%/}"
+      case " ${ITEMS[*]} " in
+        *" $n "*) SKIP="$SKIP$n " ;;
+        *) bad_usage "--skip $2: not one of the names this command copies" ;;
+      esac
+      shift ;;
+    --no-omz) OMZ=0 ;;
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) break ;;
   esac
-  printf '%s[%s] [%s]%s %s\n' "$color" "$ts" "$level" "$NC" "$msg"
-  printf '[%s] [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE"
-}
-
-show_help() {
-  cat <<EOF
-mbm-copy-zsh-settings — Copy zsh config from this Mac to ${REMOTE}
-
-Usage:
-  $0              Run the copy (with confirmation prompt)
-  $0 --dry-run    Show what would happen, no changes
-  $0 --help       Show this help
-
-What it does:
-  1. Lists local dotfiles & oh-my-zsh custom/ that will be copied
-  2. Backs up existing remote dotfiles to ~/.zsh-backup-<timestamp>/
-  3. Copies dotfiles via rsync
-  4. Installs oh-my-zsh on remote if missing
-  5. Copies your ~/.oh-my-zsh/custom/ (themes, plugins)
-  6. Tells you what to review before sourcing on the remote
-
-Logs: ${LOG_DIR}/
-EOF
-}
-
-# ssh wrapper that uses SSH_OPTS array
-rssh() {
-  ssh "${SSH_OPTS[@]}" "$REMOTE" "$@"
-}
-
-# rsync wrapper
-do_rsync() {
-  local src="$1"
-  local dest="$2"
-  local label="$3"
-  local extra_args=()
-
-  if [[ "$DRY_RUN" == true ]]; then
-    extra_args+=("--dry-run")
-  fi
-
-  log INFO "Copying ${label}: ${src} → ${REMOTE}:${dest}"
-
-  if [[ ${#SSH_OPTS[@]} -gt 0 ]]; then
-    rsync -avz --human-readable "${extra_args[@]}" \
-      -e "ssh ${SSH_OPTS[*]}" \
-      "$src" "${REMOTE}:${dest}" 2>&1 | tee -a "$LOG_FILE"
-  else
-    rsync -avz --human-readable "${extra_args[@]}" \
-      "$src" "${REMOTE}:${dest}" 2>&1 | tee -a "$LOG_FILE"
-  fi
-}
-
-# ─── Phases ─────────────────────────────────────────────────────────────────
-
-check_local() {
-  log INFO "Scanning local zsh config files..."
-
-  LOCAL_FILES=()
-  for f in "${DOTFILES[@]}"; do
-    if [[ -f "$HOME/$f" ]]; then
-      LOCAL_FILES+=("$f")
-      log INFO "  found: ~/$f"
-    fi
-  done
-
-  LOCAL_DIRS=()
-  for d in "${DOTDIRS[@]}"; do
-    if [[ -d "$HOME/$d" ]]; then
-      LOCAL_DIRS+=("$d")
-      log INFO "  found dir: ~/$d"
-    fi
-  done
-
-  if [[ ${#LOCAL_FILES[@]} -eq 0 && ${#LOCAL_DIRS[@]} -eq 0 ]]; then
-    log ERROR "No local zsh config files found. Nothing to copy."
-    exit 1
-  fi
-
-  if [[ "$COPY_OMZ_CUSTOM" == true && -d "$HOME/.oh-my-zsh/custom" ]]; then
-    OMZ_CUSTOM_FOUND=true
-    log INFO "  found: ~/.oh-my-zsh/custom/ (themes/plugins)"
-  else
-    OMZ_CUSTOM_FOUND=false
-  fi
-}
-
-check_remote() {
-  log INFO "Checking remote ${REMOTE}..."
-
-  if ! rssh "echo connected" >/dev/null 2>&1; then
-    log ERROR "Cannot SSH to ${REMOTE}. Check your SSH setup."
-    exit 1
-  fi
-  log OK "SSH connection works"
-
-  REMOTE_OS=$(rssh "uname -s" 2>/dev/null || echo "unknown")
-  log INFO "Remote OS: ${REMOTE_OS}"
-
-  if rssh "test -d ~/.oh-my-zsh" 2>/dev/null; then
-    REMOTE_HAS_OMZ=true
-    log INFO "Remote already has oh-my-zsh"
-  else
-    REMOTE_HAS_OMZ=false
-    log INFO "Remote does NOT have oh-my-zsh — will install"
-  fi
-
-  REMOTE_SHELL=$(rssh "dscl . -read /Users/${REMOTE_USER} UserShell 2>/dev/null | awk '{print \$2}'" || echo "")
-  log INFO "Remote login shell: ${REMOTE_SHELL:-unknown}"
-}
-
-backup_remote() {
-  local backup_dir="\$HOME/.zsh-backup-$(date +%Y%m%d-%H%M%S)"
-
-  if [[ "$DRY_RUN" == true ]]; then
-    log INFO "[DRY RUN] Would back up existing remote dotfiles to ${backup_dir}"
-    return 0
-  fi
-
-  log INFO "Backing up existing remote dotfiles to ${backup_dir}..."
-
-  # Build a shell snippet that creates the backup dir and moves anything that exists
-  local files_list
-  files_list=$(printf '%s ' "${DOTFILES[@]}")
-
-  rssh "mkdir -p ${backup_dir} && for f in ${files_list}; do
-    if [ -e \"\$HOME/\$f\" ]; then
-      cp -a \"\$HOME/\$f\" \"${backup_dir}/\" 2>/dev/null && echo \"  backed up \$f\"
-    fi
-  done
-  if [ -d \"\$HOME/.config/zsh\" ]; then
-    cp -a \"\$HOME/.config/zsh\" \"${backup_dir}/\" && echo \"  backed up .config/zsh\"
-  fi
-  echo \"Backup at: ${backup_dir}\"" 2>&1 | tee -a "$LOG_FILE"
-
-  log OK "Backup complete"
-}
-
-install_omz_remote() {
-  if [[ "$REMOTE_HAS_OMZ" == true ]]; then
-    log INFO "Skipping oh-my-zsh install (already present on remote)"
-    return 0
-  fi
-
-  if [[ "$DRY_RUN" == true ]]; then
-    log INFO "[DRY RUN] Would install oh-my-zsh on remote"
-    return 0
-  fi
-
-  log INFO "Installing oh-my-zsh on remote..."
-  # KEEP_ZSHRC=yes prevents the installer from overwriting .zshrc
-  # (we're about to copy ours anyway, but this avoids a race where the installer
-  # writes its template after our copy)
-  # RUNZSH=no skips dropping into a new shell
-  # CHSH=no skips changing the login shell
-  rssh 'sh -c "RUNZSH=no CHSH=no KEEP_ZSHRC=yes \
-    \$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"' \
-    2>&1 | tee -a "$LOG_FILE"
-
-  log OK "oh-my-zsh installed"
-}
-
-copy_files() {
-  log INFO "Copying dotfiles..."
-
-  for f in "${LOCAL_FILES[@]}"; do
-    do_rsync "$HOME/$f" "$f" "$f"
-  done
-
-  for d in "${LOCAL_DIRS[@]}"; do
-    # Use trailing slash on source to copy contents
-    rssh "mkdir -p ~/$d" 2>/dev/null || true
-    do_rsync "$HOME/$d/" "$d/" "$d/"
-  done
-
-  if [[ "$OMZ_CUSTOM_FOUND" == true ]]; then
-    rssh "mkdir -p ~/.oh-my-zsh/custom" 2>/dev/null || true
-    do_rsync "$HOME/.oh-my-zsh/custom/" ".oh-my-zsh/custom/" "oh-my-zsh custom/"
-  fi
-}
-
-print_followup() {
-  cat <<EOF
-
-${BOLD}─── Next steps on the remote ───${NC}
-
-  1. SSH in and review the copied .zshrc:
-     ${CYAN}ssh ${REMOTE}${NC}
-     ${CYAN}less ~/.zshrc${NC}
-
-  2. Watch for these things that may need adjusting:
-     • Homebrew path: should be /opt/homebrew (Apple Silicon) or /usr/local (Intel)
-     • Anything referencing local-only paths (e.g. ~/Projects/foo)
-     • Plugins listed in ZSH_THEME / plugins=() — confirm they're installed
-     • Any API keys / tokens you exported — make sure you want them on the remote
-
-  3. Try loading the config:
-     ${CYAN}exec zsh -l${NC}
-
-  4. If something breaks, restore the backup:
-     ${CYAN}ls ~/.zsh-backup-*${NC}
-     ${CYAN}cp ~/.zsh-backup-<timestamp>/.zshrc ~/.zshrc${NC}
-
-  5. If you want zsh to be the default login shell on the remote:
-     ${CYAN}chsh -s /bin/zsh${NC}
-
-EOF
-}
-
-confirm() {
-  if [[ "$DRY_RUN" == true ]]; then return 0; fi
-  echo
-  printf '%sThis will overwrite zsh config files on %s.%s\n' "$YELLOW" "$REMOTE" "$NC"
-  printf 'Existing files will be backed up first.\n'
-  printf 'Proceed? [y/N] '
-  read -r answer
-  if [[ ! "$answer" =~ ^[Yy]$ ]]; then
-    log INFO "Aborted by user"
-    exit 0
-  fi
-}
-
-if [[ -z "$REMOTE_HOST" && "${1:-}" != "-h" && "${1:-}" != "--help" ]]; then
-  echo "No remote host is set. Export MBM_REMOTE_HOST (for example in the local.env file of your installation)." >&2
-  exit 1
-fi
-
-# ─── Main ───────────────────────────────────────────────────────────────────
-mkdir -p "$LOG_DIR"
-
-case "${1:-}" in
-  -h|--help) show_help; exit 0 ;;
-  -n|--dry-run) DRY_RUN=true ;;
-  '') : ;;
-  *) log ERROR "Unknown option: $1"; show_help; exit 1 ;;
+  shift
+done
+[ $# -eq 0 ] || bad_usage "unexpected argument: $1"
+[ -n "$HOST" ] || bad_usage "no machine to copy to: give --host HOST or set MBM_REMOTE_HOST"
+case "$HOST" in
+  *@*) REMOTE="$HOST" ;;
+  *) REMOTE="${RUSER:-${USER:-$(id -un)}}@$HOST" ;;
 esac
+case "$REMOTE" in -*|*[[:space:]]*) bad_usage "not a usable user and host: $REMOTE" ;; esac
 
-[[ "$DRY_RUN" == true ]] && log INFO "DRY RUN — no changes will be made"
+send=()
+left=""
+for i in "${ITEMS[@]}"; do
+  [ -f "$HOME/$i" ] || [ -d "$HOME/$i" ] || continue
+  case "$SKIP" in *" $i "*) left="$left $i" ;; *) send+=("$i") ;; esac
+done
+[ ${#send[@]} -gt 0 ] || die "nothing to copy: no zsh configuration in $HOME${left:+ besides what --skip leaves out}"
+command -v ssh >/dev/null 2>&1 || die "ssh is not installed (Linux: apt install openssh-client)"
+command -v rsync >/dev/null 2>&1 || die "rsync is not installed (Linux: apt install rsync)"
 
-check_local
-check_remote
+# on_remote SCRIPT - run it on the other machine with sh, whatever the login shell there is
+on_remote() { printf '%s\n' "$1" | ssh "$REMOTE" sh; }
 
-if [[ "$REMOTE_OS" != "Darwin" ]]; then
-  log WARN "Remote OS is '${REMOTE_OS}', not Darwin. Some macOS-specific config (Homebrew path, pbcopy, etc.) may not work."
+# One look at the other machine: its system, its login shell, oh-my-zsh, which of the names exist.
+# shellcheck disable=SC2016  # the $ in single quotes are for the shell on the other machine
+probe="$(on_remote 'echo "os=$(uname -s)"; echo "shell=$SHELL"; [ -d "$HOME/.oh-my-zsh" ] && echo "omz=yes"
+for i in '"${ITEMS[*]}"'; do [ -e "$HOME/$i" ] && echo "has=$i"; done; exit 0')" \
+  || die "cannot reach $REMOTE with ssh (try: ssh $REMOTE)"
+r_os="$(printf '%s\n' "$probe" | sed -n 's/^os=//p')"
+[ -n "$r_os" ] || die "$REMOTE did not answer as expected"
+r_shell="$(printf '%s\n' "$probe" | sed -n 's/^shell=//p')"
+there=" $(printf '%s\n' "$probe" | sed -n 's/^has=//p' | tr '\n' ' ')"
+r_omz=no
+case "$probe" in *omz=yes*) r_omz=yes ;; esac
+need_omz=0
+[ "$OMZ" = 1 ] && [ -d "$HOME/.oh-my-zsh" ] && [ "$r_omz" = no ] && need_omz=1
+
+# The plan: files go in one rsync, each folder in its own; what is there already is backed up.
+bdir=".zsh-backup-$(date +%Y%m%d-%H%M%S)"
+files=()
+dirs=""
+old=""
+echo "To $REMOTE ($r_os):"
+for i in "${send[@]}"; do
+  if [ "$i" = .oh-my-zsh/custom ] && [ "$r_omz" = no ] && [ "$need_omz" = 0 ]; then
+    printf '  %-19s %s\n' "$i/" "not copied: oh-my-zsh is not installed there"
+    continue
+  fi
+  note="new there"
+  case "$there" in *" $i "*) note="is there already: kept in ~/$bdir/"; old="$old $i" ;; esac
+  if [ -d "$HOME/$i" ]; then
+    dirs="$dirs $i"
+    i="$i/"
+  else
+    files+=("$HOME/$i")
+  fi
+  printf '  %-19s %s\n' "$i" "$note"
+done
+[ -n "$left" ] && echo "Left out:$left"
+[ "$need_omz" = 1 ] && echo "oh-my-zsh is missing there: its installer will be downloaded from $OMZ_INSTALLER and run there (--no-omz: do not)."
+[ ${#files[@]} -gt 0 ] || [ -n "$dirs" ] || die "nothing to copy"
+
+RSYNC=(rsync -avzL)
+[ "$DRY" = 1 ] && RSYNC+=(--dry-run)
+copy() {
+  local d
+  if [ ${#files[@]} -gt 0 ]; then
+    "${RSYNC[@]}" "${files[@]}" "$REMOTE:" || return 1
+  fi
+  # shellcheck disable=SC2086  # names from ITEMS: no spaces
+  for d in $dirs; do
+    # In a dry run a folder that is not there yet is left untried: rsync would stop at its missing parent.
+    if [ "$DRY" = 1 ]; then case "$there" in *" $d "*) ;; *) continue ;; esac; fi
+    "${RSYNC[@]}" "$HOME/$d/" "$REMOTE:$d/" || return 1
+  done
+}
+
+if [ "$DRY" = 1 ]; then
+  echo "Dry run - what rsync would send; nothing is changed on $REMOTE:"
+  copy || die "rsync failed"
+  exit 0
 fi
+confirm "Copy these to $REMOTE?" || die "nothing was copied"
 
-confirm
-backup_remote
-install_omz_remote
-copy_files
-print_followup
+# One more connection prepares the other machine: backup, then oh-my-zsh, then the folders.
+# shellcheck disable=SC2016  # the $ in single quotes are for the shell on the other machine
+prep="b=\"\$HOME/$bdir\"; old='${old# }'; dirs='${dirs# }'"'
+for i in $old; do mkdir -p "$b/$(dirname "$i")" && cp -a "$HOME/$i" "$b/$i" || exit 41; done'
+[ "$need_omz" = 1 ] && prep="$prep
+s=\"\$(curl -fsSL $OMZ_INSTALLER)\" && [ -n \"\$s\" ] && RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c \"\$s\" </dev/null || exit 42"
+# shellcheck disable=SC2016
+prep="$prep"'
+for i in $dirs; do mkdir -p "$HOME/$i" || exit 43; done'
+on_remote "$prep"
+case $? in
+  0) ;;
+  41) die "the backup on $REMOTE failed; nothing was changed there" ;;
+  42) die "oh-my-zsh could not be installed on $REMOTE (it needs zsh, curl and git there); nothing was copied. Add --no-omz to copy without it" ;;
+  *) die "preparing $REMOTE failed; nothing was copied" ;;
+esac
+copy || die "rsync failed${old:+; what was there before is in ~/$bdir/ on $REMOTE}"
 
-log OK "Done. Log saved to ${LOG_FILE}"
+echo
+echo "Done. To try it:  ssh $REMOTE  and there  exec zsh -l"
+[ -n "$old" ] && echo "To go back, there:  cp -a ~/$bdir/. ~/"
+case "$r_shell" in
+  */zsh) ;;
+  *) echo "The login shell there is ${r_shell:-unknown}, not zsh. To change it, there:  chsh -s \"\$(command -v zsh)\"" ;;
+esac
+[ "$r_os" = "$(uname -s)" ] || echo "That machine runs $r_os, this one $(uname -s): paths in the files (Homebrew's, for example) may need a change there."
+exit 0

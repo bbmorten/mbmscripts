@@ -1,24 +1,114 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# mbm-my-sync - copy a folder to another place with rsync, now and again after every change
+#
+# Usage:
+#   mbm-my-sync [options] SRC DST
+#   mbm-my-sync [options] SRC DST USER HOST
+#
+# Arguments:
+#   SRC         the folder to watch. As with rsync, "SRC" puts the folder itself into
+#               DST and "SRC/" puts what is in it into DST.
+#   DST         a folder on this machine, or USER@HOST:FOLDER on another one (over ssh)
+#   USER HOST   the older way to name another machine: the same as USER@HOST:DST
+#
+# Options:
+#   -D, --delete    also remove from DST what is not in SRC: anything in DST that SRC
+#                   does not have is lost. It asks first; look with -n before.
+#   -n, --dry-run   show what rsync would copy (and with -D remove), once; change nothing
+#   -y, --yes       with -D: do not ask
+#   -h, --help      show this help
+#
+# It copies once at the start and then waits. Changes that come close together are
+# copied in one go. Without -D nothing is ever removed from DST. Stop it with Ctrl-C.
+#
+# Examples:
+#   mbm-my-sync ~/notes /Volumes/backup
+#   mbm-my-sync -n -D ~/site/ deploy@web1.example.com:/var/www/site
+#   mbm-my-sync -D -y ~/site/ deploy@web1.example.com:/var/www/site
+#   mbm-my-sync ~/notes notes deploy web1.example.com
+#
+# Needs: rsync, and a file watcher: fswatch (macOS: brew install fswatch) or
+#        inotifywait (Linux: apt install inotify-tools). For another machine, ssh
+#        access that does not ask for a password every time. macOS and Linux.
+# Exit status: 0 stopped with Ctrl-C, or -n finished; 1 an error; 2 wrong usage.
 
-if [ $# -eq 2 ]; then
-    SRC="$1"
-    DST="$2"
-elif [ $# -eq 4 ]; then
-    SRC="$1"
-    DST="$2"
-    USER="$3"
-    HOST="$4"
-else
-    echo "Usage: $0 source_folder destination_folder [remote_username remote_host]"
-    exit 1
+set -u
+ME="${0##*/}"
+SELF="$0"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%my-sync}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+confirm() {   # confirm "Delete 3 files?"   true on y / yes
+  local a
+  [ "$YES" = 1 ] && return 0
+  [ -t 0 ] || die "$1 - not asked: this is not a terminal. Add --yes to go ahead."
+  printf '%s [y/N] ' "$1"
+  read -r a || a=""
+  case "$a" in y|Y|yes|Yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+DELETE=0
+DRY=0
+YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -D|--delete) DELETE=1 ;;
+    -n|--dry-run) DRY=1 ;;
+    -y|--yes) YES=1 ;;
+    --) shift; break ;;
+    -?*) bad_usage "unknown option: $1" ;;
+    *) break ;;
+  esac
+  shift
+done
+case $# in
+  2) SRC="$1"; DST="$2" ;;
+  4) SRC="$1"; DST="$3@$4:$2" ;;
+  *) bad_usage "give SRC DST, or SRC DST USER HOST" ;;
+esac
+# rsync and the watcher would read a name that starts with a dash as an option.
+case "$SRC" in -*) SRC="./$SRC" ;; esac
+case "$DST" in -*) DST="./$DST" ;; esac
+[ -d "$SRC" ] || die "no such folder: $SRC"
+command -v rsync >/dev/null 2>&1 || die "rsync is not installed (Linux: apt install rsync)"
+
+RSYNC=(rsync -avz --inplace)
+[ "$DELETE" = 1 ] && RSYNC+=(--delete)
+if [ "$DRY" = 1 ]; then
+  "${RSYNC[@]}" --dry-run "$SRC" "$DST" || die "rsync failed"
+  exit 0
 fi
 
-if [ -z "$USER" ] || [ -z "$HOST" ]; then
-    while inotifywait -r "$SRC"; do
-        rsync -avz --delete --inplace "$SRC" "$DST"
-    done
+if command -v fswatch >/dev/null 2>&1; then
+  WATCH=(fswatch -o -r "$SRC")
+elif command -v inotifywait >/dev/null 2>&1; then
+  WATCH=(inotifywait -m -r -q -e modify -e create -e delete -e move -e attrib "$SRC")
 else
-    while inotifywait -r "$SRC"; do
-        rsync -avz --delete --inplace "$SRC" "$USER"@"$HOST":"$DST"
-    done
+  die "no file watcher is installed: fswatch (macOS: brew install fswatch) or inotifywait (Linux: apt install inotify-tools)"
 fi
+if [ "$DELETE" = 1 ]; then
+  confirm "Remove from $DST everything that is not in $SRC?" || die "nothing was done"
+fi
+
+# The watcher writes one line per change into a pipe. It is started before the first copy,
+# so a change made during that copy is not missed.
+tmpd="$(mktemp -d)" || die "cannot create a temporary folder"
+wpid=""
+trap '[ -n "$wpid" ] && kill "$wpid" 2>/dev/null; rm -rf "$tmpd"' EXIT
+trap 'echo "$ME: stopped" >&2; exit 0' INT TERM
+mkfifo "$tmpd/changes" || die "cannot create a pipe in $tmpd"
+"${WATCH[@]}" > "$tmpd/changes" &
+wpid=$!
+exec 3< "$tmpd/changes"
+
+"${RSYNC[@]}" "$SRC" "$DST" || die "rsync failed"
+echo "$ME: watching $SRC with ${WATCH[0]}; stop with Ctrl-C" >&2
+while IFS= read -r _ <&3; do
+  while IFS= read -r -t 1 _ <&3; do :; done   # more changes: wait until it is quiet for a second
+  "${RSYNC[@]}" "$SRC" "$DST" || echo "$ME: rsync failed; it runs again after the next change" >&2
+done
+wait "$wpid"
+rc=$?
+wpid=""
+die "${WATCH[0]} ended (exit $rc); no longer watching"

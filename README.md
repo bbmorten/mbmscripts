@@ -60,22 +60,74 @@ or `bash`, which read these files. Nothing needs to be set inside those programs
 
 ## The commands
 
-`mbm-help` prints this list on your own computer; `mbm-help docker` shows only the lines that
-mention `docker`.
+Every command answers `--help` with what it does, its options and examples; `mbm-help`
+lists them all on your own computer, `mbm-help docker` only the lines that mention docker,
+and `mbm-help --check` says which of them can run on this machine and what is missing.
+
+Commands that delete, stop or overwrite something list what they will do and ask first.
+They all have `-n` (dry run: show, change nothing) and `-y` (do not ask). Without a
+terminal they refuse instead of guessing, so **a script or scheduled job must pass `--yes`**.
 
 ### macOS and network
 
 | Command | What it does |
 | --- | --- |
-| `mbm-dns-flush` | Flushes the macOS DNS cache and restarts the DNS service. It runs `sudo dscacheutil -flushcache; sudo killall mDNSResponder` and asks for your Mac password. |
-| `mbm-btvpn` | Connects to your company's Cisco VPN with one command: password from the Keychain, SMS code read from Messages. Start with `mbm-btvpn setup`. |
-| `mbm-multivpn` | Keeps a second VPN connected next to the company one (needs `openconnect` and `ocproxy`). |
-| `mbm-print-route` | Prints one line of the routing table for the interface you name. |
-| `mbm-sslkeylog-capture` | Starts a browser with TLS keys logged while `tshark` captures the packets. |
-| `mbm-eth-conv` | Counts the Ethernet conversations in a capture file. |
-| `mbm-extract-time-info-w-tshark` | First packet, last packet and duration of a capture file. |
-| `mbm-interface-test` | Takes the `ens160` interface down for 60 seconds, then up again (Linux). |
-| `mbm-logger` | Records the terminal session to a log file. |
+| `mbm-dns-flush` | Flush the macOS DNS cache and restart the DNS service (asks for your Mac password). |
+| `mbm-btvpn` | Connect to your company's Cisco VPN with one command (Keychain password, SMS code from Messages). |
+| `mbm-multivpn` | Keep a second VPN connected next to the company one (openconnect + ocproxy). |
+| `mbm-print-route` | Show the routing table in short form, or the route used to reach one destination. |
+| `mbm-interface-test` | Take a network interface down for some seconds, then bring it up again (asks first). |
+| `mbm-sslkeylog-capture` | Record a browser session as a packet capture plus the TLS keys that decrypt it. |
+| `mbm-eth-conv` | Count the frames between each pair of Ethernet addresses in a capture file. |
+| `mbm-extract-time-info-w-tshark` | Show first and last packet time, duration and packet count of capture files. |
+| `mbm-logger` | Record the terminal session to a dated log file, or list the logs. |
+
+### Files and folders
+
+| Command | What it does |
+| --- | --- |
+| `mbm-find-file` | Find files and folders by name or part of a name under a folder, ignoring case. |
+| `mbm-find-files-over-100m` | List the files over 100 MB (or another size) under a folder, largest first. |
+| `mbm-find-and-delete-duplicates` | Find files with identical content and delete all but one of each, asking first. |
+| `mbm-list-folders-with-pdf` | List the folders that contain PDF files, or files with another extension. |
+| `mbm-du` | Show the disk space used by a folder and the folders in it, largest first. |
+| `mbm-cp-dir-structure` | Copy the folders of a tree to another place, without the files in them. |
+| `mbm-cp-dir-structure-w-files` | Copy a folder tree with all its files or only matching ones, never overwriting a file. |
+
+### Copying between machines
+
+| Command | What it does |
+| --- | --- |
+| `mbm-sync-git-msp` | Mirror a local folder to a folder on a remote host with rsync over ssh. |
+| `mbm-sync-git-msp-v2` | Mirror a local folder to a remote host with rsync, with progress and a history of runs. |
+| `mbm-my-sync` | Copy a folder to another place with rsync, now and again after every change. |
+| `mbm-my-sync-fswatch` | Pull a folder from another machine with rsync, now and after every change there. |
+| `mbm-copy-zsh-settings` | Copy your zsh configuration to another machine over ssh, with a backup there. |
+
+### Markdown and documentation sites
+
+| Command | What it does |
+| --- | --- |
+| `mbm-insert-date` | Replace the placeholder {{DATE}} in files with today's date. |
+| `mbm-change-filename` | Rename DDMMYYYY.md files under a folder to YYYYMMDD.md so that they sort by date. |
+| `mbm-replace-heading` | Rewrite a first-line heading # DDMMYYYY as # YYYYMMDD in the Markdown files of a folder. |
+| `mbm-create-outline-markdown` | Turn the list items of a Markdown outline into links to stub pages it creates. |
+| `mbm-nextra-setup` | Create a Nextra 4 documentation site project in a new folder. |
+| `mbm-nextra-setup-w-podman` | Create a Nextra 4 documentation site project with a Podman runner script. |
+| `mbm-sdd` | Serve a mkdocs documentation project locally while you edit it. |
+| `mbm-run-docker-web` | Build a mkdocs site, copy it to a remote host and serve it there with nginx in Docker. |
+| `mbm-run-docker-web3` | Publish a second mkdocs site (docker-v3) the same way, with its own folders. |
+
+### Containers and models
+
+| Command | What it does |
+| --- | --- |
+| `mbm-docker-cmdline` | Print the command line a container or image runs, quoted for pasting into a shell. |
+| `mbm-docker-compose-start-services` | Start Docker Compose projects by folder name under a base folder, or list them. |
+| `mbm-docker-compose-stop-services-all` | Stop or take down every running Docker Compose project, after listing and asking. |
+| `mbm-srd` | Start the Docker Compose project in a folder in the background, or stop it. |
+| `mbm-lima-podman-w-target` | Start the Lima podman machine kept in a disk image on an external volume (macOS). |
+| `mbm-delete-old-models` | Delete the ollama models pulled or changed at least N days ago, after listing them. |
 
 `mbm-btvpn` and `mbm-multivpn` are the tools from
 [btvpn-multivpn](https://github.com/bbmorten/btvpn-multivpn). That repository has the
@@ -83,50 +135,8 @@ step-by-step guide for them, in [English](https://github.com/bbmorten/btvpn-mult
 and [Turkish](https://github.com/bbmorten/btvpn-multivpn/blob/main/README.tr.md); read
 `btvpn` as `mbm-btvpn` and `multivpn` as `mbm-multivpn`.
 
-### Files and folders
-
-| Command | What it does |
-| --- | --- |
-| `mbm-find-file` | Finds a file by name under a starting folder. |
-| `mbm-find-files-over-100m` | Lists the files larger than 100 MB under a folder. |
-| `mbm-find-and-delete-duplicates` | Finds files with identical content and offers to delete the copies. |
-| `mbm-list-folders-with-pdf` | Lists the folders that contain PDF files. |
-| `mbm-du` | Saves the size of each subdirectory, largest first, to a file. |
-| `mbm-cp-dir-structure` | Copies a directory tree without its files. |
-| `mbm-cp-dir-structure-w-files` | Copies a directory, optionally adding an `index.md`. |
-| `mbm-sync-git-msp` | Rsyncs a local folder to a remote host (dry run, watch mode). |
-| `mbm-sync-git-msp-v2` | The same with live progress and a history. |
-| `mbm-my-sync` | Rsyncs a folder each time it changes (Linux, `inotifywait`). |
-| `mbm-my-sync-fswatch` | Pulls a remote folder when it changes. Its author marked it "not working". |
-| `mbm-copy-zsh-settings` | Copies your zsh configuration to a remote Mac over ssh. |
-
-### Markdown and documentation
-
-| Command | What it does |
-| --- | --- |
-| `mbm-insert-date` | Replaces `{{DATE}}` in a file with today's date. |
-| `mbm-change-filename` | Renames `DDMMYYYY.md` files in a folder to `YYYYMMDD.md`. |
-| `mbm-replace-heading` | Rewrites `# DDMMYYYY` first-line headings as `# YYYYMMDD`. |
-| `mbm-create-outline-markdown` | Turns the list items of a Markdown file into links to generated pages. |
-| `mbm-nextra-setup` | Scaffolds a Nextra documentation project. |
-| `mbm-nextra-setup-w-podman` | The same, set up to run with Podman. |
-| `mbm-sdd` | Serves the mkdocs site in `~/git-repos/docker`. |
-| `mbm-srd` | Starts the Docker Compose stack in `~/git-repos/mydocs`. |
-| `mbm-run-docker-web`, `mbm-run-docker-web3` | Build an mkdocs site and serve it with nginx on a remote host. |
-
-### Containers and models
-
-| Command | What it does |
-| --- | --- |
-| `mbm-docker-cmdline` | Prints the entrypoint and command of a container. |
-| `mbm-docker-compose-start-services` | Starts the Docker Compose projects you name. |
-| `mbm-docker-compose-stop-services-all` | Stops every running Docker Compose project. |
-| `mbm-lima-podman-w-target` | Starts Lima with Podman from a sparsebundle on an external volume. |
-| `mbm-delete-old-models` | Deletes ollama models that were not modified for more than a week. |
-
-These are personal tools published as they are. Several assume a particular folder layout or
-need other programs (`tshark`, `docker`, `rsync`, `ollama`, ...). Read a script before you rely
-on it; each is a single readable file in [`bin/`](bin/).
+[CHANGES.md](CHANGES.md) lists, per command, what was wrong with the old version and what
+behaves differently now.
 
 ## Your own settings
 
@@ -135,15 +145,31 @@ those in `~/.<name>/local.env`. The installer never touches that file, and both 
 
 ```sh
 # ~/.mbmscripts/local.env
-export MBM_REMOTE_HOST="192.0.2.10"          # mbm-sync-git-msp, mbm-copy-zsh-settings
-export MBM_REMOTE_USER="me"                  # default: your local user name
-export MBM_SYNC_SOURCE_DIR="$HOME/git-msp/"  # default: ~/git-msp/
-export MBM_SYNC_REMOTE_DIR="git-msp/"        # default: git-msp/ in the remote home folder
-export MBM_SYNC_V2_REMOTE_HOST="192.0.2.11"  # mbm-sync-git-msp-v2 only; default: MBM_REMOTE_HOST
-export MBM_SSLKEYLOG_DIR="$HOME/captures"    # default: ~/.local/share/mbm-sslkeylog-capture
-export MBM_LIMA_VOLUME="MyDisk"              # default: External
-export MBM_REPLACE_HEADING_DIR="$HOME/notes" # default: the current folder
+export MBM_REMOTE_HOST="192.0.2.10"           # sync-git-msp(-v2), copy-zsh-settings (or --host)
+export MBM_REMOTE_USER="me"                   # default: your local user name
+export MBM_SYNC_SOURCE_DIR="$HOME/git-msp/"   # sync-git-msp(-v2) --source; default ~/git-msp/
+export MBM_SYNC_REMOTE_DIR="git-msp/"         # sync-git-msp(-v2) --dest; default git-msp/
+export MBM_SYNC_V2_REMOTE_HOST="192.0.2.11"   # sync-git-msp-v2 only; default: MBM_REMOTE_HOST
+export MBM_CONTAINER_ENGINE="podman"          # the docker-* commands; default docker
+export MBM_COMPOSE_BASE_DIR="$HOME/projects"  # docker-compose-start-services; default ~/git-repos
+export MBM_SRD_DIR="$HOME/git-repos/mydocs"   # srd; this is the default
+export MBM_SDD_DIR="$HOME/git-repos/docker"   # sdd; this is the default
+export MBM_DOCKER_WEB_DIR="$HOME/git-repos/docker"      # run-docker-web; this is the default
+export MBM_DOCKER_WEB3_DIR="$HOME/git-repos/docker-v3"  # run-docker-web3; this is the default
+export MBM_DOCKER_WEB_USER="vm"               # run-docker-web(3), the user on the host; default vm
+export MBM_DOCKER_WEB_REMOTE_DIR="site"       # run-docker-web; default: the project folder's name
+export MBM_DOCKER_WEB3_REMOTE_DIR="site3"     # run-docker-web3; default: the project folder's name
+export MBM_LIMA_VOLUME="MyDisk"               # lima-podman-w-target; default External
+export MBM_LIMA_TEMPLATE="template://podman"  # lima-podman-w-target; this is the default
+export MBM_LOGGER_DIR="$HOME/TerminalLogs"    # logger; default ~/Documents/Temp/TerminalLogs
+export MBM_REPLACE_HEADING_DIR="$HOME/notes"  # replace-heading, when no folder is given
+export MBM_SSLKEYLOG_DIR="$HOME/captures"     # sslkeylog-capture; default ~/.local/share/sslkeylog-capture
+export MBM_SSLKEYLOG_CHROME="/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"
+export MBM_SSLKEYLOG_FIREFOX="/usr/bin/firefox"
 ```
+
+Every one of them can also be given as an option on the command line; `--help` of each
+command names its settings.
 
 These variable names always start with `MBM_`, whatever prefix you chose for the commands.
 
@@ -176,16 +202,29 @@ is copied first). Without a clone, download `uninstall.sh` from this page and ru
 ```sh
 git clone https://github.com/bbmorten/mbmscripts.git
 cd mbmscripts
-tests/run.sh      # offline: no sudo, no VPN, no Keychain; installs only into a temporary HOME
-./install.sh      # the commands then point at this clone
+tests/run.sh            # every check, offline
+tests/run.sh du         # the checks of one command
+./install.sh            # the commands then point at this clone
 ```
 
 - `bin/mbm-<name>` is a command. The file name always carries `mbm-`; the installer creates
-  `<prefix><name>` for whatever prefix the user chose. A script that prints its own name
-  should use `$(basename "$0")`.
-- `libexec/` holds helper files that are not commands, and `descriptions.txt`, one
-  `<name><TAB>description` line per command (the tests check that it is complete).
-- Scripts are `bash` or `zsh`, chosen by their first line; they sit side by side in `bin/`.
+  `<prefix><name>` for whatever prefix the user chose.
+- Lines 2 and following of a command are one comment block that IS its `--help`: a first
+  line `mbm-<name> - what it does`, then `Usage:`, `Options:`, `Examples:` and, where they
+  say something, `Needs:`, `Settings:`, `Exit status:`. `tests/run.sh` checks that `--help`
+  and `-h` print it and exit 0 without doing anything, that it follows another prefix, that
+  an unknown option exits 2, and that `shellcheck` is clean. Copy the preamble of any
+  command in `bin/` for a new one.
+- Exit status: 0 done, 1 could not do the job, 2 called wrongly. Errors go to standard error.
+- `libexec/descriptions.txt` holds one line per command: name, a tab, the one-line
+  description, and optionally a tab and what it needs (program names, `os:macos`,
+  `os:linux`) for `mbm-help --check`. The tests check that every command has a line.
+- `tests/commands/<name>.sh` tests one command. Tests run in a sandbox (`tests/lib.sh`): an
+  empty temporary home folder, no `MBM_*` settings, and fakes in place of everything that
+  reaches outside (ssh, rsync, sudo, docker, ollama, ...), so they never touch your machine.
+  `tests/sandbox.sh` runs any command by hand in the same sandbox.
+- Scripts run under the `/bin/bash` 3.2 that macOS ships, and use only what macOS and Linux
+  provide (BSD and GNU sed, awk, date, find).
 
 ## License
 
