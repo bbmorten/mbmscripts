@@ -75,6 +75,7 @@ terminal they refuse instead of guessing, so **a script or scheduled job must pa
 | `mbm-dns-flush` | Flush the macOS DNS cache and restart the DNS service (asks for your Mac password). |
 | `mbm-btvpn` | Connect to your company's Cisco VPN with one command (Keychain password, SMS code from Messages). |
 | `mbm-multivpn` | Keep a second VPN connected next to the company one (openconnect + ocproxy). |
+| `mbm-entra-ip` | Add your public IP to a Microsoft Entra named location, or list, add and remove its IP ranges (needs PowerShell 7). |
 | `mbm-print-route` | Show the routing table in short form, or the route used to reach one destination. |
 | `mbm-interface-bounce` | Take a network interface down for some seconds, then bring it up again (asks first). |
 | `mbm-sslkeylog-capture` | Record a browser session as a packet capture plus the TLS keys that decrypt it. |

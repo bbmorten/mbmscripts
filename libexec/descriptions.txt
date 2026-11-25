@@ -11,6 +11,7 @@ docker-cmdline	Print the command line a container or image runs, quoted for past
 docker-compose-start-services	Start Docker Compose projects by folder name under a base folder, or list them	docker
 docker-compose-stop-services-all	Stop or take down every running Docker Compose project, after listing and asking	docker
 du	Show the disk space used by a folder and the folders in it, largest first
+entra-ip	Add your public IP to a Microsoft Entra named location, or list, add and remove its IP ranges	curl pwsh
 eth-conv	Count the frames between each pair of Ethernet addresses in a capture file	tshark
 extract-time-info-w-tshark	Show first and last packet time, duration and packet count of capture files	tshark
 find-and-delete-duplicates	Find files with identical content and delete all but one of each, asking first

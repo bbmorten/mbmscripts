@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# mbm-entra-ip - add your public IP to a Microsoft Entra named location, or list and edit its IP ranges
+#
+# Usage:
+#   mbm-entra-ip [options]                  add your current public IPv4 address (as /32)
+#   mbm-entra-ip [options] list             show the ranges; marks the one that holds your IP
+#   mbm-entra-ip [options] add RANGE...     add ranges (203.0.113.0/24; a bare address is /32)
+#   mbm-entra-ip [options] remove RANGE...  remove ranges (also: delete, rm)
+#   mbm-entra-ip [options] edit             add and delete by hand, then save once
+#   mbm-entra-ip [options] restore FILE     put back the ranges of a backup this command made
+#   mbm-entra-ip ip                         only print your public IPv4 address; no sign-in
+#
+# Options:
+#   -l, --location NAME  the named location (Conditional Access > Named locations); an
+#                        "IP ranges" location, not a countries one
+#   -t, --tenant ID      the tenant to sign in to (its ID or domain); default: your home tenant
+#   -n, --dry-run        show the change, change nothing
+#   -y, --yes            do not ask before saving
+#   -f, --force          add a range even when a wider range in the list already holds it
+#       --device-code    sign in with a code on another device instead of the browser
+#   -h, --help           show this help
+#
+# Your address is asked of the services in MBM_ENTRA_IP_SERVICES, in order (default
+# ifconfig.me, api.ipify.org, icanhazip.com, checkip.amazonaws.com). The first two that
+# answer must agree; if they do not (a split-tunnel VPN can do that), it stops and shows both.
+#
+# Graph has no call that adds or removes one range: every change writes the whole list. So
+# before saving it shows the ranges added (+) and removed (-), asks, saves the location as it
+# was to a JSON file (see MBM_ENTRA_IP_BACKUP_DIR), refuses if someone changed the location
+# in the meantime, and reads it back afterwards. Removing the range that holds your current
+# IP gives a warning: a policy that allows sign-in only from this location would lock you out.
+# Without a terminal it changes nothing unless --yes is given; edit always needs a terminal.
+#
+# Sign-in is the Microsoft Graph PowerShell one (app "Microsoft Graph Command Line Tools"),
+# with Policy.Read.All, plus Policy.ReadWrite.ConditionalAccess for a change. The token is
+# cached, so the browser opens only now and then. A change needs the role Conditional Access
+# Administrator (or Security Administrator).
+#
+# Examples:
+#   mbm-entra-ip -l Bulent                      add the IP you have now
+#   mbm-entra-ip -l Bulent list
+#   mbm-entra-ip -l Bulent add 198.51.100.0/24 203.0.113.9
+#   mbm-entra-ip -l Bulent remove 203.0.113.9
+#   mbm-entra-ip -l Bulent edit
+#   mbm-entra-ip -l Bulent restore ~/.local/state/mbm-entra-ip/20261125-101500-Bulent.json
+#
+# Settings (environment variables, e.g. in ~/.zshrc):
+#   MBM_ENTRA_LOCATION      the location when -l is not given
+#   MBM_ENTRA_TENANT        the tenant when -t is not given
+#   MBM_ENTRA_IP_SERVICES   the address services, separated by spaces
+#   MBM_ENTRA_IP_BACKUP_DIR where backups go; default ~/.local/state/mbm-entra-ip
+#
+# Exit status: 0 done (also: nothing to change, or you answered no), 1 could not do it
+# (no address found, sign-in or Graph failed), 2 called wrongly or a bad range.
+#
+# Needs: curl; PowerShell 7 (brew install powershell) with the module
+# Microsoft.Graph.Authentication (pwsh -c 'Install-Module Microsoft.Graph.Authentication -Scope CurrentUser').
+
+set -u
+
+# The real location of this file, through the symlink the installer made.
+ME="$(basename "$0")"
+SELF="$0"
+while [ -L "$SELF" ]; do
+  _dir="$(cd "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  case "$SELF" in /*) ;; *) SELF="$_dir/$SELF" ;; esac
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+HELPER="$SELF_DIR/../libexec/entra-ip.ps1"
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF" | sed "s/mbm-/${ME%entra-ip}/g"; }
+die() { echo "$ME: $*" >&2; exit 1; }
+bad_usage() { echo "$ME: $* (see: $ME --help)" >&2; exit 2; }
+
+LOCATION="${MBM_ENTRA_LOCATION:-}"
+TENANT="${MBM_ENTRA_TENANT:-}"
+SERVICES="${MBM_ENTRA_IP_SERVICES:-https://ifconfig.me/ip https://api.ipify.org https://icanhazip.com https://checkip.amazonaws.com}"
+BACKUP_DIR="${MBM_ENTRA_IP_BACKUP_DIR:-$HOME/.local/state/mbm-entra-ip}"
+DRY=0
+YES=0
+FORCE=0
+DEVICE=0
+
+# Options may come before or after the action and its ranges.
+POS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -l|--location) [ $# -ge 2 ] || bad_usage "$1 needs a name"; LOCATION="$2"; shift 2 ;;
+    --location=*) LOCATION="${1#*=}"; shift ;;
+    -t|--tenant) [ $# -ge 2 ] || bad_usage "$1 needs a tenant ID or domain"; TENANT="$2"; shift 2 ;;
+    --tenant=*) TENANT="${1#*=}"; shift ;;
+    -n|--dry-run) DRY=1; shift ;;
+    -y|--yes) YES=1; shift ;;
+    -f|--force) FORCE=1; shift ;;
+    --device-code) DEVICE=1; shift ;;
+    --) shift; while [ $# -gt 0 ]; do POS+=("$1"); shift; done ;;
+    -?*) bad_usage "unknown option $1" ;;
+    *) POS+=("$1"); shift ;;
+  esac
+done
+set -- "${POS[@]+"${POS[@]}"}"
+
+ACTION="me"
+if [ $# -gt 0 ]; then
+  case "$1" in
+    list|ls|show) ACTION=list ;;
+    add) ACTION=add ;;
+    remove|delete|rm|del) ACTION=remove ;;
+    edit) ACTION=edit ;;
+    restore) ACTION=restore ;;
+    ip) ACTION=ip ;;
+    *) bad_usage "unknown action '$1' (list, add, remove, edit, restore or ip)" ;;
+  esac
+  shift
+fi
+case "$ACTION" in
+  add|remove) [ $# -gt 0 ] || bad_usage "$ACTION needs at least one range" ;;
+  restore) [ $# -eq 1 ] || bad_usage "restore needs exactly one backup file"
+           [ -f "$1" ] || bad_usage "no such file: $1" ;;
+  *) [ $# -eq 0 ] || bad_usage "$ACTION takes no arguments; got: $1" ;;
+esac
+for _r in "$@"; do
+  case "$_r" in *,*) bad_usage "give ranges separated by spaces, not commas: $_r" ;; esac
+done
+
+# ---------------------------------------------------------------- public address
+
+valid_ipv4() {
+  printf '%s\n' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+  local IFS=. o
+  # shellcheck disable=SC2086 # split on the dots on purpose
+  set -- $1
+  for o in "$@"; do [ "$o" -le 255 ] || return 1; done
+  return 0
+}
+
+# Sets MY_IP and MY_IP_FROM, or leaves MY_IP empty. With "strict", two answers that differ stop it.
+find_ip() {
+  local url ans first="" first_from="" host
+  MY_IP=""
+  MY_IP_FROM=""
+  for url in $SERVICES; do
+    ans="$(curl -4 -fsS --max-time 5 "$url" 2>/dev/null | tr -d ' \r\n\t')"
+    valid_ipv4 "$ans" || continue
+    host="${url#*://}"; host="${host%%/*}"
+    if [ -z "$first" ]; then first="$ans"; first_from="$host"; continue; fi
+    if [ "$ans" != "$first" ]; then
+      [ "${1:-}" = strict ] && die "the services disagree: $first_from says $first, $host says $ans (a split-tunnel VPN sends them different ways). Add the right one with: $ME add ADDRESS"
+      MY_IP="$first"; MY_IP_FROM="$first_from"; return 0
+    fi
+    MY_IP="$first"; MY_IP_FROM="$first_from and $host agree"; return 0
+  done
+  [ -n "$first" ] && { MY_IP="$first"; MY_IP_FROM="$first_from only; no other service answered"; }
+  return 0
+}
+
+if [ "$ACTION" = ip ]; then
+  find_ip strict
+  [ -n "$MY_IP" ] || die "no service answered with an IPv4 address (tried: $SERVICES)"
+  echo "$MY_IP"
+  echo "($MY_IP_FROM)" >&2
+  exit 0
+fi
+
+# ---------------------------------------------------------------- Entra
+
+[ -n "$LOCATION" ] || bad_usage "which named location? Give -l NAME, or set MBM_ENTRA_LOCATION"
+command -v pwsh >/dev/null 2>&1 || die "needs PowerShell 7 (pwsh): brew install powershell"
+[ -f "$HELPER" ] || die "missing its helper $HELPER; install again"
+
+if [ "$ACTION" = edit ] && ! [ -t 0 ]; then
+  die "edit needs a terminal"
+fi
+case "$ACTION" in
+  me|add|remove|restore)
+    if [ "$DRY" = 0 ] && [ "$YES" = 0 ] && ! [ -t 0 ]; then
+      die "no terminal to ask on, so nothing was changed. Add --yes to save without asking, or -n to only show the change"
+    fi ;;
+esac
+
+if [ "$ACTION" = me ]; then
+  find_ip strict
+  [ -n "$MY_IP" ] || die "no service answered with an IPv4 address (tried: $SERVICES)"
+  echo "Your public IPv4 address: $MY_IP ($MY_IP_FROM)"
+  set -- "$MY_IP"
+  ACTION=add
+else
+  # Only to mark your range and to warn before you remove it; no answer is fine.
+  find_ip
+fi
+
+PS_ACTION="$ACTION"
+ARGS=(-Action "$PS_ACTION" -Location "$LOCATION" -BackupDir "$BACKUP_DIR" -Me "$ME")
+[ -n "$TENANT" ] && ARGS+=(-Tenant "$TENANT")
+[ -n "$MY_IP" ] && ARGS+=(-MyIp "$MY_IP")
+if [ "$ACTION" = restore ]; then
+  ARGS+=(-RestoreFile "$1")
+elif [ $# -gt 0 ]; then
+  ARGS+=(-Cidrs "$(IFS=,; printf '%s' "$*")")
+fi
+[ "$DRY" = 1 ] && ARGS+=(-DryRun)
+[ "$YES" = 1 ] && ARGS+=(-Yes)
+[ "$FORCE" = 1 ] && ARGS+=(-Force)
+[ "$DEVICE" = 1 ] && ARGS+=(-DeviceCode)
+
+pwsh -NoProfile -NoLogo -File "$HELPER" "${ARGS[@]}"
